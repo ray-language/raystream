@@ -1,0 +1,131 @@
+// Arnés del A/B de escritores: para cada modo levanta un proceso NUEVO de `writer_ab`,
+// mide su RSS en reposo, lanza N descargas en paralelo muestreando, y reporta el delta
+// sobre el reposo. Varias rondas y mediana, porque una sola muestra de RSS es ruidosa.
+//
+//   ray run bench/writer_ab_run.ray -- <binario writer_ab> <fichero> [clientes] [rondas]
+import std/process;
+import std/time;
+import bench/harness;
+from bench/harness import Sampler;
+
+const PORT: int = 8099;
+
+fn main() -> int {
+    let argv: [string] = args();
+    if (argv.len() < 2) {
+        print("usage: writer_ab_run <writer_ab binary> <file> [clients] [rounds]");
+        return 2;
+    }
+    let binary: string = argv[0];
+    let file: string = argv[1];
+    let clients: int = if (argv.len() > 2) { parse_int(argv[2]).unwrap_or(32) } else { 32 };
+    let rounds: int = if (argv.len() > 3) { parse_int(argv[3]).unwrap_or(3) } else { 3 };
+
+    print("${clients} clientes · ${rounds} rondas · proceso nuevo por medida");
+    print("");
+    print("modo       reposo      pico     delta  delta/conex.       caudal");
+    report("direct", binary, file, clients, rounds);
+    report("package", binary, file, clients, rounds);
+    0
+}
+
+fn report(mode: string, binary: string, file: string, clients: int, rounds: int) {
+    var idles: [int] = [];
+    var peaks: [int] = [];
+    var deltas: [int] = [];
+    var rates: [int] = [];
+    var r: int = 0;
+    while (r < rounds) {
+        let m: [int] = one_round(mode, binary, file, clients);
+        if (m.len() == 4) {
+            idles.push(m[0]);
+            peaks.push(m[1]);
+            deltas.push(m[1] - m[0]);
+            rates.push(m[2]);
+        }
+        r = r + 1;
+        time.sleep(500);
+    }
+    if (deltas.len() == 0) {
+        print("${harness.pad_right(mode, 9)} (sin medidas: ¿arrancó el servidor?)");
+        return;
+    }
+    let delta: int = harness.median(deltas);
+    print(
+        "${harness.pad_right(mode, 9)}"
+            + "${harness.pad_left(harness.mb(harness.median(idles)), 8)}M"
+            + "${harness.pad_left(harness.mb(harness.median(peaks)), 10)}M"
+            + "${harness.pad_left(harness.mb(delta), 10)}M"
+            + "${harness.pad_left(to_string(delta / clients), 13)}K"
+            + "${harness.pad_left(to_string(harness.median(rates)), 12)} MB/s"
+    );
+    print("          deltas por ronda: ${mb_list(deltas)} · caudales: ${int_list(rates)} MB/s");
+}
+
+// Una ronda: levanta el servidor, espera a que escuche, mide y lo mata.
+// Devuelve [reposo_kb, pico_kb, mb_por_segundo, octetos] o [] si no arrancó.
+fn one_round(mode: string, binary: string, file: string, clients: int) -> [int] {
+    match (process.cmd(binary, [mode, file, to_string(PORT)]).stream()) {
+        Result.Err(e) => {
+            eprint("no se pudo lanzar ${binary}: ${e}");
+            []
+        },
+        Result.Ok(server) => {
+            let url: string = "http://127.0.0.1:${PORT}/f";
+            if (!wait_until_up(url, 200)) {
+                server.kill(true);
+                server.wait();
+                return [];
+            }
+            let pid: int = server.pid();
+            time.sleep(300);
+            let idle: int = harness.rss_kb(pid);
+            let sampler: Sampler = harness.sample_rss(pid, 5);
+            let got: [int] = harness.parallel_drain(url, clients);
+            let peak: int = harness.sampler_peak(sampler);
+            server.kill(true);
+            server.wait();
+            let rate: int = if (got[1] > 0) { got[0] / 1048576 * 1000 / got[1] } else { 0 };
+            [idle, peak, rate, got[0]]
+        },
+    }
+}
+
+// Sondea hasta que el puerto responde (o se agotan los intentos).
+fn wait_until_up(url: string, attempts: int) -> bool {
+    var i: int = 0;
+    while (i < attempts) {
+        if (harness.drain(url).ok) {
+            return true;
+        }
+        time.sleep(50);
+        i = i + 1;
+    }
+    false
+}
+
+fn int_list(values: [int]) -> string {
+    var out: string = "[";
+    var i: int = 0;
+    while (i < values.len()) {
+        if (i > 0) {
+            out = out + ", ";
+        }
+        out = out + to_string(values[i]);
+        i = i + 1;
+    }
+    out + "]"
+}
+
+fn mb_list(values: [int]) -> string {
+    var out: string = "[";
+    var i: int = 0;
+    while (i < values.len()) {
+        if (i > 0) {
+            out = out + ", ";
+        }
+        out = out + harness.mb(values[i]);
+        i = i + 1;
+    }
+    out + "] MB"
+}

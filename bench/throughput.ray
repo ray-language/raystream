@@ -1,0 +1,153 @@
+// Banco de caudal y concurrencia contra un raystream en marcha.
+//
+//   ray run bench/throughput.ray -- <id-del-item> [host:puerto] [patrón-del-proceso]
+//
+// Mide cuatro cosas: descargas completas en paralelo, peticiones pequeñas con Range (lo
+// que hace un reproductor al saltar), el coste por petición y el de la API JSON, con el
+// RSS del servidor muestreado cada 10 ms.
+import std/time;
+import bench/harness;
+from bench/harness import Sampler;
+
+fn main() -> int {
+    let argv: [string] = args();
+    if (argv.len() < 1) {
+        print("usage: throughput <item-id> [host:port] [process-pattern]");
+        return 2;
+    }
+    let item: string = argv[0];
+    let origin: string = if (argv.len() > 1) { argv[1] } else { "127.0.0.1:8080" };
+    let pattern: string = if (argv.len() > 2) { argv[2] } else { "raystream" };
+    let media: string = "http://${origin}/media/${item}";
+
+    let pid: int = match (harness.pid_of(pattern)) {
+        Option.Some(p) => p,
+        Option.None => {
+            print("no server process matching '${pattern}' — RSS will read 0");
+            0
+        },
+    };
+    print("servidor pid ${pid} · RSS en reposo ${harness.mb(harness.rss_kb(pid))} MB");
+    print("");
+
+    print("A) descarga completa en paralelo");
+    run_parallel(media, pid, 1);
+    run_parallel(media, pid, 4);
+    run_parallel(media, pid, 16);
+    run_parallel(media, pid, 32);
+
+    print("");
+    print("B) peticiones pequeñas con Range (lo que hace un reproductor al saltar)");
+    run_ranges(media, pid, 1);
+    run_ranges(media, pid, 16);
+    run_ranges(media, pid, 64);
+
+    print("");
+    print("C) 300 peticiones Range secuenciales (conexión nueva cada vez)");
+    run_sequential(media, 300);
+
+    print("");
+    print("D) API JSON (pasa por el actor del catálogo)");
+    run_api("http://${origin}/api/library", 300);
+
+    print("");
+    print("RSS final ${harness.mb(harness.rss_kb(pid))} MB");
+    0
+}
+
+fn run_parallel(url: string, pid: int, n: int) {
+    let sampler: Sampler = harness.sample_rss(pid, 10);
+    let r: [int] = harness.parallel_drain(url, n);
+    let peak: int = harness.sampler_peak(sampler);
+    let octets: int = r[0];
+    let millis: int = r[1];
+    let per_client: int = if (n > 0) { octets / n } else { 0 };
+    print(
+        "   "
+            + to_string(harness.pad_left(to_string(n), 2))
+            + " clientes: "
+            + "${harness.pad_left(to_string(millis), 5)} ms · "
+            + "${harness.pad_left(harness.mb_per_s(octets, millis), 7)} MB/s agregados · "
+            + "${harness.pad_left(harness.mb_per_s(per_client, millis), 7)} MB/s por cliente · "
+            + "RSS pico ${harness.mb(peak)} MB"
+    );
+}
+
+fn run_ranges(url: string, pid: int, n: int) {
+    // Con pocas peticiones el reloj de milisegundos no tiene resolución: se repite la
+    // tanda hasta reunir al menos 256 peticiones.
+    let rounds: int = if (n >= 256) { 1 } else { 256 / n };
+    let sampler: Sampler = harness.sample_rss(pid, 10);
+    let started: int = time.now();
+    var got: int = 0;
+    var round: int = 0;
+    while (round < rounds) {
+        var tasks: [Task<int>] = [];
+        var i: int = 0;
+        while (i < n) {
+            tasks.push(spawn(fn() -> int { range_get(url, 1000000, 1065535).bytes_read }));
+            i = i + 1;
+        }
+        var j: int = 0;
+        while (j < tasks.len()) {
+            got = got + join(tasks[j]);
+            j = j + 1;
+        }
+        round = round + 1;
+    }
+    let millis: int = time.now() - started;
+    let total_requests: int = n * rounds;
+    let peak: int = harness.sampler_peak(sampler);
+    let per_second: int = if (millis > 0) { total_requests * 1000 / millis } else { 0 };
+    print(
+        "   "
+            + to_string(harness.pad_left(to_string(n), 2))
+            + " en paralelo: "
+            + "${harness.pad_left(to_string(total_requests), 4)} peticiones en "
+            + "${harness.pad_left(to_string(millis), 5)} ms · "
+            + "${harness.pad_left(to_string(per_second), 6)} req/s · "
+            + "RSS pico ${harness.mb(peak)} MB"
+    );
+}
+
+fn run_sequential(url: string, times: int) {
+    let started: int = time.now();
+    var i: int = 0;
+    while (i < times) {
+        range_get(url, 0, 65535);
+        i = i + 1;
+    }
+    let millis: int = time.now() - started;
+    report_rate(millis, times);
+}
+
+fn run_api(url: string, times: int) {
+    let started: int = time.now();
+    var i: int = 0;
+    while (i < times) {
+        harness.drain(url);
+        i = i + 1;
+    }
+    let millis: int = time.now() - started;
+    report_rate(millis, times);
+}
+
+fn report_rate(millis: int, times: int) {
+    let per_request_us: int = if (times > 0) { millis * 1000 / times } else { 0 };
+    let per_second: int = if (millis > 0) { times * 1000 / millis } else { 0 };
+    print("   ${millis_of(per_request_us)} ms por petición · ${per_second} req/s");
+}
+
+// Microsegundos como "N.MM" milisegundos.
+fn millis_of(micros: int) -> string {
+    let hundredths: int = micros / 10;
+    let whole: int = hundredths / 100;
+    let frac: int = hundredths % 100;
+    "${whole}.${if (frac < 10) { "0" } else { "" }}${frac}"
+}
+
+fn range_get(url: string, from_byte: int, to_byte: int) -> harness.Got {
+    var headers: Map<string, string> = Map.new();
+    headers.insert("Range", "bytes=${from_byte}-${to_byte}");
+    harness.drain_with(url, headers)
+}

@@ -38,21 +38,16 @@ fn main() -> int {
     print("writer_ab mode=${mode} file=${file} size=${size} port=${port}");
     let limits: webserver.Limits = webserver.default_limits();
     limits.max_conns = 128;
-    match (webserver.serve_raw_limits(
-        "127.0.0.1",
-        port,
-        limits,
-        fn(req: webserver.Request, conn: int) {
-            if (mode == "direct") {
-                serve_direct(conn, file, size);
-            } else {
-                match (webserver.send_response(conn, webserver.serve_file(file, req))) {
-                    Result.Ok(_) => { },
-                    Result.Err(_) => { },
-                }
+    match (webserver.serve_raw_limits("127.0.0.1", port, limits, fn(req: webserver.Request, conn: int) {
+        if (mode == "direct") {
+            serve_direct(conn, file, size);
+        } else {
+            match (webserver.send_response(conn, webserver.serve_file(file, req))) {
+                Result.Ok(_) => { },
+                Result.Err(_) => { },
             }
         }
-    )) {
+    })) {
         Result.Ok(_) => 0,
         Result.Err(e) => {
             eprint(e);

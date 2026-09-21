@@ -1,0 +1,216 @@
+// Lo común a los bancos de pruebas: descargar midiendo, muestrear el RSS de otro proceso
+// y sacar medianas. Todo en raylang — el banco ejercita el lenguaje tanto como el servidor.
+//
+// El RSS se obtiene llamando a `ps`: raylang no expone la memoria del proceso (hallazgo 20
+// de NOTES-raylang.md), así que hasta que exista esa API el rodeo es inevitable.
+// Sin `import std/sort`: el módulo no compila a nativo (NOTES-raylang.md, hallazgo 21)
+// y `sort` es builtin libre, así que no hace falta.
+import std/process;
+import std/time;
+import net/http;
+
+/// Result of one download: octets read and whether it finished cleanly.
+pub struct Got {
+    bytes_read: int,
+    ok: bool,
+}
+
+/// Downloads `url` discarding the body, so the client never holds the file in memory
+/// (the point is to measure the server, not to buffer 256 MB here).
+pub fn drain(url: string) -> Got {
+    let headers: Map<string, string> = Map.new();
+    consume(url, headers)
+}
+
+/// Same, with request headers (`Range`, for instance).
+pub fn drain_with(url: string, headers: Map<string, string>) -> Got {
+    consume(url, headers)
+}
+
+fn consume(url: string, headers: Map<string, string>) -> Got {
+    match (http.stream("GET", url, b"", headers)) {
+        Result.Err(_) => Got { bytes_read: 0, ok: false },
+        Result.Ok(s) => {
+            var total: int = 0;
+            var go: bool = true;
+            var ok: bool = true;
+            while (go) {
+                match (http.stream_read(s)) {
+                    Result.Err(_) => {
+                        ok = false;
+                        go = false;
+                    },
+                    Result.Ok(piece) => {
+                        match (piece) {
+                            Option.None => {
+                                go = false;
+                            },
+                            Option.Some(chunk) => {
+                                total = total + chunk.len();
+                            },
+                        }
+                    },
+                }
+            }
+            http.stream_close(s);
+            Got { bytes_read: total, ok: ok }
+        },
+    }
+}
+
+/// Runs `n` downloads of `url` at once and returns `[octets, milliseconds]`.
+pub fn parallel_drain(url: string, n: int) -> [int] {
+    let started: int = time.now();
+    var tasks: [Task<Got>] = [];
+    var i: int = 0;
+    while (i < n) {
+        tasks.push(spawn(fn() -> Got { drain(url) }));
+        i = i + 1;
+    }
+    var total: int = 0;
+    var j: int = 0;
+    while (j < tasks.len()) {
+        total = total + join(tasks[j]).bytes_read;
+        j = j + 1;
+    }
+    [total, time.now() - started]
+}
+
+/// The resident size of a process in KB, via `ps` (0 when it cannot be read).
+pub fn rss_kb(pid: int) -> int {
+    match (process.run("ps", ["-o", "rss=", "-p", to_string(pid)])) {
+        Result.Err(_) => 0,
+        Result.Ok(out) => {
+            match (from_utf8(out.stdout)) {
+                Result.Err(_) => 0,
+                Result.Ok(text) => parse_int(text.trim()).unwrap_or(0),
+            }
+        },
+    }
+}
+
+/// The pid of the first process whose command line matches `pattern`, via `pgrep -f`.
+pub fn pid_of(pattern: string) -> Option<int> {
+    match (process.run("pgrep", ["-f", pattern])) {
+        Result.Err(_) => Option.None,
+        Result.Ok(out) => {
+            match (from_utf8(out.stdout)) {
+                Result.Err(_) => Option.None,
+                Result.Ok(text) => {
+                    let lines: [string] = text.trim().split("\n");
+                    if (lines.len() == 0 || lines[0] == "") {
+                        Option.None
+                    } else {
+                        match (parse_int(lines[0].trim())) {
+                            Option.Some(p) => Option.Some(p),
+                            Option.None => Option.None,
+                        }
+                    }
+                },
+            }
+        },
+    }
+}
+
+/// A fiber that samples a process's RSS until told to stop. Send anything to `stop` and
+/// the peak comes back on the returned channel.
+pub struct Sampler {
+    stop: Channel<int>,
+    peak: Channel<int>,
+}
+
+/// Starts sampling `pid` every `every_ms`.
+pub fn sample_rss(pid: int, every_ms: int) -> Sampler {
+    let stop: Channel<int> = Channel.new();
+    let peak: Channel<int> = Channel.new();
+    spawn(fn() {
+        var high: int = rss_kb(pid);
+        var go: bool = true;
+        while (go) {
+            match (try_recv(stop)) {
+                Received.Got(_) => {
+                    go = false;
+                },
+                Received.Closed => {
+                    go = false;
+                },
+                Received.Empty => {
+                    let now: int = rss_kb(pid);
+                    if (now > high) {
+                        high = now;
+                    }
+                    time.sleep(every_ms);
+                },
+            }
+        }
+        send(peak, high);
+    });
+    Sampler { stop: stop, peak: peak }
+}
+
+/// Stops the sampler and returns the peak RSS in KB.
+pub fn sampler_peak(s: Sampler) -> int {
+    send(s.stop, 1);
+    recv(s.peak).unwrap_or(0)
+}
+
+/// The median of a list (the lower of the two middles on an even count).
+pub fn median(values: [int]) -> int {
+    if (values.len() == 0) {
+        return 0;
+    }
+    var copy: [int] = [];
+    var i: int = 0;
+    while (i < values.len()) {
+        copy.push(values[i]);
+        i = i + 1;
+    }
+    // `sort` DEVUELVE el array ordenado; no ordena en el sitio.
+    let ordered: [int] = sort(copy);
+    ordered[ordered.len() / 2]
+}
+
+/// MB/s from octets and milliseconds, with one decimal, as text.
+pub fn mb_per_s(octets: int, millis: int) -> string {
+    if (millis <= 0) {
+        return "n/a";
+    }
+    let tenths: int = octets * 10000 / 1048576 / millis;
+    "${tenths / 10}.${tenths % 10}"
+}
+
+/// A size in KB rendered as MB with one decimal.
+pub fn mb(kb: int) -> string {
+    let tenths: int = kb * 10 / 1024;
+    "${tenths / 10}.${tenths % 10}"
+}
+
+/// Pads `s` with spaces on the left up to `width` (for aligned tables).
+pub fn pad_left(s: string, width: int) -> string {
+    var out: string = s;
+    while (out.len() < width) {
+        out = " " + out;
+    }
+    out
+}
+
+/// Pads on the right.
+pub fn pad_right(s: string, width: int) -> string {
+    var out: string = s;
+    while (out.len() < width) {
+        out = out + " ";
+    }
+    out
+}
+
+@test
+fn median_and_formatting() {
+    assert_eq(median([3, 1, 2]), 2);
+    assert_eq(median([]), 0);
+    assert_eq(median([5]), 5);
+    // 1 MiB en 1000 ms = 1.0 MB/s
+    assert_eq(mb_per_s(1048576, 1000), "1.0");
+    assert_eq(mb(2048), "2.0");
+    assert_eq(pad_left("7", 3), "  7");
+    assert_eq(pad_right("7", 3), "7  ");
+}

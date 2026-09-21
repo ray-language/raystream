@@ -1,104 +1,106 @@
 # Banco de pruebas
 
-Mide lo mismo, igual, para poder comparar entre versiones de raylang.
+Todo en raylang, como el servidor: el banco ejercita el lenguaje tanto como la aplicación (de hecho
+portarlo desde Python destapó el hallazgo 21 y corrigió dos conclusiones — ver más abajo).
+
+| Fichero | Qué hace |
+|---|---|
+| `harness.ray` | lo común: descargar descartando el cuerpo, lanzar N descargas en paralelo, muestrear el RSS de otro proceso con `ps`, medianas y formato |
+| `throughput.ray` | caudal y concurrencia contra un servidor en marcha: descargas completas (1/4/16/32), `Range` pequeños (1/16/64 en paralelo), coste por petición y API JSON |
+| `slow_clients.ray` | 24 clientes leyendo a ~80 KB/s: comprueba que la memoria no crece y que un cliente normal sigue atendido |
+| `writer_ab.ray` | servidor con **los dos escritores** (bucle propio y `webserver.serve_file`) en el mismo binario |
+| `writer_ab_run.ray` | arnés del A/B: proceso nuevo por medida, delta sobre el reposo, varias rondas y mediana |
+| `fiber_cost.ray` | descompone el coste en memoria de una fibra, un trozo retenido y un trozo cruzando un canal |
+
+El RSS se lee llamando a `ps` porque raylang no expone la memoria del proceso (hallazgo 20).
+
+## Cómo se usa
 
 ```sh
 # 1. Servidor (binario nativo: en la VM los números no son comparables)
 ray build --native -o /tmp/raystream && /tmp/raystream --dir media --port 8080 &
 
-# 2. Fichero grande dentro de la biblioteca (no se versiona; bórralo al terminar)
+# 2. Un fichero grande dentro de la biblioteca (no se versiona; bórralo al terminar)
 dd if=/dev/urandom of=media/video/bench.mp4 bs=1m count=256
 
 # 3. Su id, y a medir
 ID=$(curl -s "localhost:8080/api/library?kind=video" \
      | python3 -c "import json,sys;print([x['id'] for x in json.load(sys.stdin) if x['name']=='bench.mp4'][0])")
-python3 bench/throughput.py   $ID
-python3 bench/slow_clients.py $ID
+
+ray build --native bench/throughput.ray   -o /tmp/bench_throughput && /tmp/bench_throughput   $ID 127.0.0.1:8080 raystream
+ray build --native bench/slow_clients.ray -o /tmp/bench_slow       && /tmp/bench_slow         $ID 127.0.0.1:8080 raystream
 
 rm media/video/bench.mp4
 ```
 
-`throughput.py` mide descargas completas en paralelo (1/4/16/32 clientes), peticiones pequeñas con
-`Range` —lo que hace un reproductor al saltar—, el coste por petición y el de la API JSON, con el
-RSS del servidor muestreado cada 10 ms. `slow_clients.py` lanza 24 clientes leyendo a ~80 KB/s y
-comprueba que la memoria no crece y que un cliente normal sigue siendo atendido rápido.
-
-## Mediciones
-
-Binario nativo, Mac mini M4 (Mac16,10), loopback, fichero de 256 MB.
-
-| Clientes | 1.26.0 / net 0.2.0 · escritor propio | 1.27.0 / net 0.3.0 · escritor propio | 1.27.0 / net 0.3.0 · `serve_file` | **1.27.1 / net 0.3.1 · `serve_file`** |
-|---|---|---|---|---|
-| 1 | 3.883 MB/s · 42 MB | 4.259 MB/s · 50 MB | 5.740 MB/s · 24 MB | 3.035 MB/s · 19 MB |
-| 4 | 4.825 MB/s · 42 MB | 4.926 MB/s · 55 MB | 4.438 MB/s · 32 MB | 4.275 MB/s · 27 MB |
-| 16 | 4.159 MB/s · 44 MB | 4.234 MB/s · 64 MB | 3.783 MB/s · 86 MB | 3.756 MB/s · 45 MB |
-| 32 | 4.097 MB/s · 51 MB | 4.107 MB/s · 68 MB | 3.658 MB/s · 144 MB | **3.644 MB/s · 104 MB** |
-
-La última columna es la configuración actual. El salto de memoria del hallazgo 18 está corregido en
-net 0.3.1 (cola del productor 1 en vez de 4): a 32 clientes, 104 MB frente a los 144 MB de 0.3.0.
-El ~10% de caudal frente al bucle directo es el salto productor→canal→escritor y **no** se arregla
-subiendo el trozo: con `serve_file_with(1 MB, cola 1)` el RSS sube a 266 MB y el caudal no se mueve.
-La medida con un solo cliente es la más ruidosa de todas (3,0–5,7 GB/s entre ejecuciones).
-
-| Prueba | 1.26.0 | 1.27.0 |
-|---|---|---|
-| Range pequeño, secuencial | 0,14 ms · 6.975 req/s | 0,14 ms · 6.994 req/s |
-| Range pequeño, 64 en paralelo | 6.212 req/s | 6.680 req/s |
-| `/api/library` (pasa por el actor) | 0,19 ms · 5.238 req/s | 0,19 ms · 5.244 req/s |
-| 24 clientes lentos | RSS 51 → 56 MB · `/api/stats` 1,1 ms | RSS 69 → 73 MB · `/api/stats` 1,1 ms |
-| Miniatura PNG 480×480 (primera) | 16 ms nativo · 706 ms VM | 26 ms nativo · 701 ms VM |
-| Streaming de 512 MB | RSS 31 → 34 MB | — |
-
-**Lectura**: rendimiento idéntico dentro del ruido (el techo de ~4 GB/s es el loopback, no el
-servidor) y latencias iguales. Lo único que se mueve es el **RSS en reposo, 42 → 50 MB**, y el pico
-bajo carga, 51 → 68 MB, con el mismo código y la misma carga: unos 17 MB más. No está medido de
-dónde salen; candidatos son el runtime nuevo y `net` 0.3.0. Las miniaturas en nativo pasan de 16 a
-26 ms (una sola muestra: puede ser ruido).
-
-## Qué esperar de los cambios de raylang
-
-Lo que tocaría estos números, por orden: una primitiva de `sendfile` (hoy cada octeto se copia dos
-veces), keep-alive en el bucle de conexión (hoy cada salto del reproductor abre una conexión), y
-cualquier mejora del coste de asignación de `bytes` en el runtime. Los hallazgos 2, 3 y 5 de
-[../NOTES-raylang.md](../NOTES-raylang.md) son los que más cambiarían la forma del servidor.
-
-## A/B de los escritores (controlado)
-
-El resto de la tabla compara ejecuciones de versiones distintas y mide el RSS como marca de agua
-acumulada del proceso, así que no aísla el escritor. `bench/writer_ab.ray` pone **los dos escritores
-en el mismo binario** y `bench/writer_ab.py` mide cada uno en un proceso nuevo, restando el reposo:
+El A/B de escritores y la descomposición de memoria van por su cuenta:
 
 ```sh
-ray build --native bench/writer_ab.ray -o /tmp/writer_ab
 dd if=/dev/urandom of=/tmp/bench256.bin bs=1m count=256
-python3 bench/writer_ab.py /tmp/writer_ab /tmp/bench256.bin 32 3
-```
+ray build --native bench/writer_ab.ray     -o /tmp/writer_ab
+ray build --native bench/writer_ab_run.ray -o /tmp/bench_ab && /tmp/bench_ab /tmp/writer_ab /tmp/bench256.bin 32 3
 
-raylang 1.27.1 / net 0.3.1, 32 clientes, fichero de 256 MB, mediana de 3 rondas:
-
-| Escritor | Reposo | Pico | **Delta** | **Por conexión** | Caudal |
-|---|---|---|---|---|---|
-| `direct` (bucle propio, un trozo, sin fibra) | 9,0 MB | 34,2 MB | **25,3 MB** | **808 KB** | 3.836 MB/s |
-| `package` (`webserver.serve_file`, productor + canal) | 7,9 MB | 90,4 MB | **82,5 MB** | **2.642 KB** | 3.524 MB/s |
-
-**3,3× de memoria por conexión y un 8% menos de caudal.** Los deltas del bucle propio son estables
-(25/25/26 MB); los del paquete oscilan (90/83/73 MB) porque dependen de cuántos trozos hay en vuelo
-en el instante de la muestra.
-
-Extrapolado al límite de conexiones del servidor (128): ~100 MB frente a ~330 MB solo en buffers.
-Con los 32 streams simultáneos que un servidor doméstico ve como mucho, la diferencia son 57 MB:
-irrelevante. La decisión de raystream (usar `serve_file`) no cambia; lo que cambia es el número que
-hay que citar.
-
-## De dónde sale la memoria (descomposición)
-
-`bench/fiber_cost.ray` mide por separado las tres piezas del patrón productor→canal→consumidor:
-
-```sh
 ray build --native bench/fiber_cost.ray -o /tmp/fiber_cost
 /tmp/fiber_cost channel 32     # y: baseline 32 · fibers 32 · fibers 0 (runtime en vacío)
 ```
 
-Muestrea el RSS desde fuera mientras el programa espera. Resultados en 1.27.1 (runtime vacío
-6,5 MB): retener un trozo de 256 KB cuesta 267 KB, una fibra parada 54 KB, y el mismo trozo
-cruzando un canal `bounded(1)` deja 490 KB — 1,8× la carga. Ver hallazgo 19 de NOTES-raylang.md.
+Compila siempre a nativo: en la VM el mismo banco da números que no se pueden comparar con nada.
+
+## Mediciones
+
+Mac mini M4 (Mac16,10), loopback, fichero de 256 MB, binario nativo.
+
+### Caudal y concurrencia (`throughput.ray`, raylang 1.27.1 / net 0.3.1)
+
+| Clientes | Agregado | Por cliente | RSS pico |
+|---|---|---|---|
+| 1 | 5.333 MB/s | 5.333 MB/s | 18,6 MB |
+| 4 | 4.472 MB/s | 1.118 MB/s | 26,8 MB |
+| 16 | 4.108 MB/s | 257 MB/s | 44,3 MB |
+| 32 | 3.899 MB/s | 122 MB/s | 87,1 MB |
+
+| Prueba | Resultado |
+|---|---|
+| `Range` pequeño, secuencial | 0,14 ms · 7.142 req/s |
+| `Range` pequeño, 16 en paralelo | 11.130 req/s |
+| `Range` pequeño, 64 en paralelo | 14.222 req/s |
+| `/api/library` (pasa por el actor) | 0,16 ms · 6.122 req/s |
+| 24 clientes lentos | RSS +13,6 MB · `/api/stats` en 1 ms · `Range` de 64 KB en <1 ms |
+
+### A/B de escritores (`writer_ab_run.ray`, 32 clientes, mediana de 3 rondas)
+
+| Escritor | Reposo | Pico | Delta | Por conexión | Caudal |
+|---|---|---|---|---|---|
+| `direct` (bucle propio, un trozo, sin fibra) | 9,0 MB | 26,4 MB | **17,4 MB** | **557 KB** | 4.721 MB/s |
+| `package` (`webserver.serve_file`) | 12,6 MB | 63,9 MB | **51,1 MB** | **1.638 KB** | 4.708 MB/s |
+
+**2,9× de memoria por conexión, y el caudal es el mismo** (0,3% de diferencia, dentro del ruido).
+
+### Descomposición de memoria (`fiber_cost.ray`, runtime vacío 6,5 MB)
+
+| Escenario | Por unidad |
+|---|---|
+| retener un trozo de 256 KB | 267 KB |
+| una fibra viva parada | 54 KB |
+| fibra + canal `bounded(1)` + un trozo cruzándolo | 490 KB |
+
+Ver hallazgos 18, 19 y 20 en [../NOTES-raylang.md](../NOTES-raylang.md).
+
+## Lo que cambió al portar el banco de Python a raylang
+
+El banco original eran tres scripts de Python. Portarlos corrigió dos conclusiones, porque **el
+cliente era parte del experimento**:
+
+| | arnés en Python | arnés en raylang |
+|---|---|---|
+| `Range` pequeños, 64 en paralelo | 6.317 req/s | **14.222 req/s** |
+| A/B: caudal `direct` vs `package` | 3.836 vs 3.524 MB/s (−8%) | 4.721 vs 4.708 MB/s (**−0,3%**) |
+| A/B: memoria por conexión | 808 KB vs 2.642 KB (3,3×) | 557 KB vs 1.638 KB (**2,9×**) |
+
+Es decir: **el 8% de caudal que le achacaba a `serve_file` era el cliente de Python**, no el
+servidor; con un cliente que no es el cuello de botella, los dos escritores saturan lo mismo. La
+diferencia de memoria sí es real, aunque algo menor de lo medido antes (un cliente más rápido vacía
+los canales antes y deja menos trozos en vuelo).
+
+Y el porte en sí encontró un fallo del lenguaje: `import std/sort;` impide compilar a nativo
+(hallazgo 21).

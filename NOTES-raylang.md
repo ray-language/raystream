@@ -11,8 +11,8 @@ Severidades: **bloqueante** (impide el caso de uso) · **fricción** (hay rodeo,
 
 ## Estado en raylang 1.27.1 / net 0.3.1 / web 0.4.0
 
-Revisados uno a uno reejecutando cada repro. **Dieciséis de veinte resueltos**; quedan abiertos el
-9, el 10, el 19 y el 20. El código de `net`/`web` cita los números de esta bitácora
+Revisados uno a uno reejecutando cada repro. **Dieciséis de veintidós resueltos**; quedan abiertos el
+9, el 10, el 19, el 20, el 21 y el 22. El código de `net`/`web` cita los números de esta bitácora
 (`M271 (raystream [3])`, `M272 (raystream [4])`, `M275 (raystream [18])`).
 
 | # | Hallazgo | Estado |
@@ -37,6 +37,8 @@ Revisados uno a uno reejecutando cada repro. **Dieciséis de veinte resueltos**;
 | 18 | el productor de `serve_file` bufferizaba 1 MB por conexión | ✅ resuelto en net 0.3.1 — cola por defecto 1 y `serve_file_with(file, req, chunk, queue)`; RSS a 32 clientes 144 → 86 MB |
 | 19 | mover `bytes` por un canal cuesta 1,8× su tamaño | ⬜ abierto |
 | 20 | el perfilador no mide memoria ni sirve en servidores | ⬜ abierto |
+| 21 | `import std/sort;` impide compilar a nativo | ⬜ abierto |
+| 22 | `ray fmt` corrompe interpolaciones anidadas con `//` | ⬜ abierto |
 
 Los rodeos de raystream (bucle de accept propio, `serve_media` sobre la conexión cruda, comparar
 `.show()` en los tests, `find_by_id` en vez de `get`) siguen siendo válidos, pero ya son **opcionales**:
@@ -549,18 +551,21 @@ en el mismo proceso, que no es lo mismo:
 
 | Escritor | Reposo | Pico | Delta | Por conexión | Caudal |
 |---|---|---|---|---|---|
-| bucle propio (un trozo, sin fibra) | 9,0 MB | 34,2 MB | 25,3 MB | **808 KB** | 3.836 MB/s |
-| `webserver.serve_file` (productor + canal) | 7,9 MB | 90,4 MB | 82,5 MB | **2.642 KB** | 3.524 MB/s |
+| bucle propio (un trozo, sin fibra) | 9,0 MB | 26,4 MB | 17,4 MB | **557 KB** | 4.721 MB/s |
+| `webserver.serve_file` (productor + canal) | 12,6 MB | 63,9 MB | 51,1 MB | **1.638 KB** | 4.708 MB/s |
 
-O sea: **3,3× de memoria por conexión y un 8% menos de caudal**, no el "doble de memoria" que decía
-la primera versión de esta nota. La teoría predecía dos trozos contra uno (512 KB contra 256 KB) y
-lo medido es 2,6 MB contra 0,8 MB, así que además del buffer pesan la pila de la fibra productora y
-la copia de cada trozo al cruzar el canal.
+O sea: **2,9× de memoria por conexión, y el mismo caudal** (0,3% de diferencia, ruido).
 
-A 3,5 GB/s sobre loopback nada de esto importa —ninguna red real se acerca— y raystream se queda
-con `serve_file` y sus valores por defecto. Pero con el límite de 128 conexiones son ~100 MB contra
-~330 MB sólo en buffers, que sí es una diferencia de configuración. Si algún día importa, la vía
-sería que el emisor leyese el fichero él mismo (un `sendfile`, o un modo sin fibra intermedia).
+**Corrección importante.** Las dos primeras versiones de esta nota decían "el doble de memoria" y
+luego "3,3× y un 8% menos de caudal". Ambas se midieron con un arnés escrito en Python, y al
+portarlo a raylang (`bench/writer_ab_run.ray`) el cliente dejó de ser el cuello de botella: **el 8%
+de caudal era del cliente, no del servidor**, y la memoria por conexión baja a 2,9× porque un
+cliente más rápido vacía los canales antes y deja menos trozos en vuelo. La diferencia de memoria
+es real; la de velocidad no existía.
+
+Con el límite de 128 conexiones son ~70 MB contra ~205 MB sólo en buffers, que sigue siendo una
+diferencia de configuración. Si algún día importa, la vía sería que el emisor leyese el fichero él
+mismo (un `sendfile`, o un modo sin fibra intermedia).
 
 ---
 
@@ -632,3 +637,93 @@ medio simplemente no sabrá por qué su servidor ocupa lo que ocupa.
    sin eso el perfilador no sirve para servidores ni para nada de larga vida.
 3. Que `--heap` acepte también un tope en octetos, no sólo en objetos.
 4. Y, aparte: revisar por qué un programa bajo `ray profile` ignora `SIGTERM`.
+
+---
+
+### [21] `import std/sort;` impide compilar a binario nativo — backend nativo / stdlib · severidad: bloqueante (nativo)
+
+**Qué pasó:** al portar el banco de pruebas a raylang, el build nativo falló con tres errores de
+**rustc** dentro de la stdlib:
+
+```
+error[E0277]: the trait bound `T: Ord` is not satisfied
+    --> src/main.rs:3230:48
+3230 | Rc::new(RefCell::new(__ray_sort(&a.clone()).borrow().iter().rev()…
+note: required by a bound in `__ray_sort`
+ 101 | fn __ray_sort<T: Ord + Clone>(…)
+```
+
+Vienen de `std::sort::sort_desc` y `std::sort::dedup`: el código generado para esas dos funciones
+genéricas pierde la cota `Ord`.
+
+**Repro mínimo** (6 líneas; `ray run` imprime `[1, 2, 3]`, `ray build --native` falla):
+
+```raylang
+import std/sort;
+
+fn main() -> int {
+    let xs: [int] = [3, 1, 2];
+    print(sort(xs));
+    0
+}
+```
+
+Quitando el `import` el mismo programa compila — `sort` es builtin libre. Es decir: **basta importar
+el módulo**, sin llamar a nada suyo, para que el programa deje de compilarse a nativo.
+
+**Por qué importa:** es el mismo patrón del hallazgo 5 —errores de rustc sobre código que el
+programador no escribió— pero esta vez dentro de la propia stdlib, y sin ninguna pista de qué lo
+provoca: el fichero del usuario no aparece en el mensaje.
+
+**Propuesta:** añadir la cota `Ord` al código generado de `sort_desc`/`dedup` (o instanciar sólo lo
+que se usa), y comprobar en CI que cada módulo de `std/` compila a nativo por sí solo.
+
+**Rodeo aplicado:** no importar `std/sort` en `bench/harness.ray`.
+
+---
+
+### [22] `ray fmt` corrompe una interpolación anidada que contenga `//` — herramienta · severidad: bloqueante (corrompe el fuente)
+
+**Qué pasó:** al formatear el banco de pruebas, `ray fmt -w` reescribió esta línea de
+`bench/slow_clients.ray`
+
+```raylang
+print("latencia de /api/stats: ${elapsed_ms("http://${origin}/api/stats")} ms");
+```
+
+añadiéndole basura al final:
+
+```raylang
+print("latencia de /api/stats: ${elapsed_ms("http://${origin}/api/stats")} ms");  //${origin}/api/stats")} ms");
+```
+
+**Repro mínimo** (verificado):
+
+```raylang
+fn tag(s: string) -> string { s }
+
+fn main() -> int {
+    let origin: string = "127.0.0.1:8080";
+    print("latencia: ${tag("http://${origin}/api")} ms");
+    0
+}
+// ray fmt →  print("latencia: ${tag("http://${origin}/api")} ms");  //${origin}/api")} ms");
+```
+
+Con la misma forma pero sin `//` dentro (`"host/${origin}/api"`) el formateo es correcto: el
+lexer del formateador trata el `//` de `http://` —dentro de una cadena que ya está dentro de una
+interpolación— como principio de comentario, y duplica el resto de la línea.
+
+**Y se acumula**: cada pasada de `ray fmt -w` añade otros 26 caracteres. Tres pasadas dejan la
+línea en 136 caracteres, con tres colas repetidas.
+
+**Por qué importa:** `fmt -w` reescribe el fichero. Es la única herramienta del juego cuyo fallo
+**daña el código fuente**, y lo hace en silencio: el resultado sigue compilando (todo lo añadido es
+comentario), así que ni el checker ni los tests lo detectan. Una URL dentro de un mensaje
+interpolado no es un caso rebuscado.
+
+**Propuesta:** que el lexer del formateador no busque comentarios dentro de una cadena, a cualquier
+nivel de anidamiento. Y una prueba de idempotencia en CI: `fmt(fmt(x)) == fmt(x)` sobre el corpus,
+que habría cazado esto solo.
+
+**Rodeo aplicado:** sacar la URL a una variable antes de interpolarla.

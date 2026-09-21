@@ -1,0 +1,102 @@
+// Clientes lentos: el caso que tumba a un servidor de medios mal hecho. Varias conexiones
+// leyendo a cuentagotas mientras se comprueba que la memoria no crece y que un cliente
+// normal sigue siendo atendido rápido.
+//
+//   ray run bench/slow_clients.ray -- <id-del-item> [host:puerto] [patrón-del-proceso]
+import std/time;
+import net/http;
+import bench/harness;
+
+/// How many slow readers to run at once.
+const READERS: int = 24;
+
+/// Octets per read and pause between reads: ~80 KB/s per client.
+const READ_SIZE: int = 16384;
+
+const PAUSE_MS: int = 200;
+
+/// How long the slow readers keep going.
+const DURATION_MS: int = 4000;
+
+fn main() -> int {
+    let argv: [string] = args();
+    if (argv.len() < 1) {
+        print("usage: slow_clients <item-id> [host:port] [process-pattern]");
+        return 2;
+    }
+    let item: string = argv[0];
+    let origin: string = if (argv.len() > 1) { argv[1] } else { "127.0.0.1:8080" };
+    let pattern: string = if (argv.len() > 2) { argv[2] } else { "raystream" };
+    let media: string = "http://${origin}/media/${item}";
+    let pid: int = harness.pid_of(pattern).unwrap_or(0);
+
+    print("RSS antes: ${harness.mb(harness.rss_kb(pid))} MB");
+    let deadline: int = time.now() + DURATION_MS;
+    var readers: [Task<int>] = [];
+    var i: int = 0;
+    while (i < READERS) {
+        readers.push(spawn(fn() -> int { trickle(media, deadline) }));
+        i = i + 1;
+    }
+
+    // Con la cola ocupada, ¿sigue respondiendo bien a los demás?
+    time.sleep(1500);
+    print("RSS con ${READERS} clientes lentos en vuelo: ${harness.mb(harness.rss_kb(pid))} MB");
+    // Sin interpolación anidada: `ray fmt` la corrompe (NOTES-raylang.md, hallazgo 22).
+    let stats_url: string = "http://${origin}/api/stats";
+    print("latencia de /api/stats: ${elapsed_ms(stats_url)} ms");
+    var headers: Map<string, string> = Map.new();
+    headers.insert("Range", "bytes=0-65535");
+    let t0: int = time.now();
+    let got: harness.Got = harness.drain_with(media, headers);
+    print("un Range de 64 KB: ${time.now() - t0} ms (${got.bytes_read} octetos)");
+
+    var total: int = 0;
+    var j: int = 0;
+    while (j < readers.len()) {
+        total = total + join(readers[j]);
+        j = j + 1;
+    }
+    print("los lentos leyeron ${total} octetos en total");
+    time.sleep(500);
+    print("RSS después: ${harness.mb(harness.rss_kb(pid))} MB");
+    0
+}
+
+// Un lector a cuentagotas: lee un trozo, duerme, repite, hasta la fecha límite.
+fn trickle(url: string, deadline: int) -> int {
+    let headers: Map<string, string> = Map.new();
+    match (http.stream("GET", url, b"", headers)) {
+        Result.Err(_) => 0,
+        Result.Ok(s) => {
+            var read: int = 0;
+            var go: bool = true;
+            while (go && time.now() < deadline) {
+                match (http.stream_read(s)) {
+                    Result.Err(_) => {
+                        go = false;
+                    },
+                    Result.Ok(piece) => {
+                        match (piece) {
+                            Option.None => {
+                                go = false;
+                            },
+                            Option.Some(chunk) => {
+                                read = read + chunk.len();
+                                time.sleep(PAUSE_MS);
+                            },
+                        }
+                    },
+                }
+            }
+            http.stream_close(s);
+            read
+        },
+    }
+}
+
+fn elapsed_ms(url: string) -> int {
+    let t0: int = time.now();
+    harness.drain(url);
+    time.now() - t0
+}
