@@ -9,12 +9,12 @@ Las referencias `webserver.ray:N` son a `.ray-deps/net/webserver.ray` de esa ver
 Severidades: **bloqueante** (impide el caso de uso) · **fricción** (hay rodeo, cuesta tiempo) ·
 **mejora** (funciona, pero podría ser mejor).
 
-## Estado en raylang 1.27.3 / net 0.3.2 / web 0.4.2
+## Estado en raylang 1.27.4 / net 0.3.3 / web 0.4.2
 
-Revisados uno a uno reejecutando cada repro. **Dieciocho de veintitrés resueltos.** Quedan abiertos
-el 9 (JPEG), el 10 (bucles por píxel en la VM), el 20 (el perfilador no mide memoria) y el 23
-(nuevo). El 19 sigue vivo como coste del lenguaje, pero ya no afecta a este servidor: `net` 0.3.2
-evita el canal por completo (M279). El código de `net`/`web` cita los números de esta bitácora
+Revisados uno a uno reejecutando cada repro. **Diecinueve de veintitrés resueltos.** Quedan
+abiertos el 9 (JPEG), el 10 (bucles por píxel en la VM) y el 20 (el perfilador no mide memoria).
+El 19 sigue vivo como coste del lenguaje, pero ya no afecta a este servidor: `net` evita el canal
+por completo al servir ficheros (M279). El código de `net`/`web` cita los números de esta bitácora
 (`M271 (raystream [3])`, `M272 (raystream [4])`, `M275 (raystream [18])`).
 
 | # | Hallazgo | Estado |
@@ -41,7 +41,7 @@ evita el canal por completo (M279). El código de `net`/`web` cita los números 
 | 20 | el perfilador no mide memoria ni sirve en servidores | ⬜ abierto |
 | 21 | `import std/sort;` impedía compilar a nativo | ✅ resuelto en 1.27.3 |
 | 22 | `ray fmt` corrompía interpolaciones anidadas con `//` | ✅ resuelto en 1.27.3 |
-| 23 | `send_response` no sabe de HEAD: manda el cuerpo | 🆕 nuevo (abajo) |
+| 23 | `send_response` no sabía de HEAD: mandaba el cuerpo | ✅ resuelto en net 0.3.3 — `send_response_for(req, conn, r)` (M283) |
 
 Los rodeos de raystream (bucle de accept propio, `serve_media` sobre la conexión cruda, comparar
 `.show()` en los tests, `find_by_id` en vez de `get`) siguen siendo válidos, pero ya son **opcionales**:
@@ -756,6 +756,16 @@ capacidad existe, pero no está expuesta.
 **Propuesta:** `send_response_for(req: Request, conn: int, r: Response) -> Result<int, string>`
 —una línea, delega en el `omit_body` que ya existe— o un `send_response_head`.
 
-**Rodeo aplicado:** `src/http/serve_media.ray` responde los HEAD por su cuenta, con un
-`stream_response_len` cuyo canal nace cerrado: pone el `Content-Length` correcto y no escribe
-cuerpo. Verificado a nivel de socket: 0 octetos.
+**Resuelto en net 0.3.3** (M283): `send_response_for(req, conn, r)`, exactamente la propuesta. El
+rodeo de `serve_media` desapareció y, de paso, **todas** las respuestas de raystream pasan ahora por
+ese emisor, así que cumplen el RFC en un HEAD — incluidas las que antes ni lo intentaban.
+Verificado a nivel de socket, cuerpo real de cada HEAD:
+
+| Petición | Content-Length | Cuerpo |
+|---|---|---|
+| `HEAD /media/<id>` | 701316 | 0 octetos |
+| `GET /media/<id>` | 701316 | 701316 octetos |
+| `HEAD /` | 1000 | 0 |
+| `HEAD /assets/app.js` | 6327 | 0 |
+| `HEAD /subs/<id>/0` | 211 | 0 |
+| `HEAD /api/stats` | 118 | 0 |

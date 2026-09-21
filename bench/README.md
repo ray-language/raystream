@@ -52,20 +52,19 @@ Mac mini M4 (Mac16,10), loopback, fichero de 256 MB, binario nativo.
 
 ### Caudal y concurrencia (`throughput.ray`)
 
-| Clientes | 1.27.1 / net 0.3.1 | **1.27.3 / net 0.3.2** |
-|---|---|---|
-| 1 | 5.333 MB/s · RSS 18,6 MB | 5.689 MB/s · RSS 16,8 MB |
-| 4 | 4.472 MB/s · RSS 26,8 MB | 9.846 MB/s · RSS 18,5 MB |
-| 16 | 4.108 MB/s · RSS 44,3 MB | 9.615 MB/s · RSS 20,8 MB |
-| 32 | 3.899 MB/s · RSS 87,1 MB | **9.626 MB/s · RSS 22,0 MB** |
+| Clientes | 1.27.1 / net 0.3.1 | 1.27.3 / net 0.3.2 | **1.27.4 / net 0.3.3** |
+|---|---|---|---|
+| 1 | 5.333 MB/s · RSS 18,6 MB | 5.689 MB/s · RSS 16,8 MB | 6.564 MB/s · RSS 21,9 MB |
+| 4 | 4.472 MB/s · RSS 26,8 MB | 9.846 MB/s · RSS 18,5 MB | 10.139 MB/s · RSS 23,2 MB |
+| 16 | 4.108 MB/s · RSS 44,3 MB | 9.615 MB/s · RSS 20,8 MB | 9.870 MB/s · RSS 25,4 MB |
+| 32 | 3.899 MB/s · RSS 87,1 MB | 9.626 MB/s · RSS 22,0 MB | **9.143 MB/s · RSS 26,5 MB** |
 
-| Prueba | 1.27.1 / net 0.3.1 | 1.27.3 / net 0.3.2 |
-|---|---|---|
-| `Range` pequeño, secuencial | 0,14 ms · 7.142 req/s | 0,11 ms · 8.823 req/s |
-| `Range` pequeño, 16 en paralelo | 11.130 req/s | 15.058 req/s |
-| `Range` pequeño, 64 en paralelo | 14.222 req/s | 21.333 req/s |
-| `/api/library` (pasa por el actor) | 0,16 ms · 6.122 req/s | 0,15 ms · 6.521 req/s |
-| Miniatura PNG 480×480 (primera) | 26 ms nativo · 701 ms VM | 19 ms nativo · 700 ms VM |
+| Prueba | 1.27.1 / net 0.3.1 | 1.27.3 / net 0.3.2 | 1.27.4 / net 0.3.3 |
+|---|---|---|---|
+| `Range` pequeño, secuencial | 0,14 ms · 7.142 req/s | 0,11 ms · 8.823 req/s | 0,11 ms · 8.823 req/s |
+| `Range` pequeño, 16 en paralelo | 11.130 req/s | 15.058 req/s | 16.000 req/s |
+| `Range` pequeño, 64 en paralelo | 14.222 req/s | 21.333 req/s | 21.333 req/s |
+| Miniatura PNG 480×480 (primera) | 26 ms nativo · 701 ms VM | 19 ms nativo · 700 ms VM | — |
 
 Con 32 clientes: **2,5× de caudal y 4× menos memoria** que la versión anterior, sin tocar una línea
 del servidor. El cambio es `FileBody` (M279 de `net` 0.3.2): el emisor lee el fichero en la propia

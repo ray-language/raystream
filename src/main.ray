@@ -104,42 +104,42 @@ fn print_summary(items: [Item]) {
 fn dispatch(st: Store, hub: Hub, rooms: Rooms, root: string, req: webserver.Request, conn: int) {
     let is_head: bool = req.method == "HEAD";
     if (req.method != "GET" && !is_head) {
-        send_simple(conn, webserver.text(405, "method not allowed\n"));
+        send_simple(req, conn, webserver.text(405, "method not allowed\n"));
         return;
     }
     match (router.resolve(req.path)) {
         Route.Home => {
-            send_asset(conn, "index.html", req, is_head);
+            send_asset(conn, "index.html", req);
         },
         Route.Asset(name) => {
-            send_asset(conn, name, req, is_head);
+            send_asset(conn, name, req);
         },
         Route.ApiLibrary => {
             let kind: string = router.query_param(req.query, "kind");
             let q: string = router.query_param(req.query, "q");
-            send_simple(conn, webserver.json_response(api.library_json(st, kind, q)));
+            send_simple(req, conn, webserver.json_response(api.library_json(st, kind, q)));
         },
         Route.ApiStats => {
-            send_simple(conn, webserver.json_response(api.stats_json(st, root)));
+            send_simple(req, conn, webserver.json_response(api.stats_json(st, root)));
         },
         Route.ApiItem(id) => {
             match (api.item_json(st, id)) {
                 Option.Some(body) => {
-                    send_simple(conn, webserver.json_response(body));
+                    send_simple(req, conn, webserver.json_response(body));
                 },
                 Option.None => {
-                    send_not_found(conn, id);
+                    send_not_found(req, conn, id);
                 },
             }
         },
         Route.Media(id) => {
-            serve_item(st, root, id, req, conn, is_head);
+            serve_item(st, root, id, req, conn);
         },
         Route.Thumb(id) => {
-            serve_thumb(st, root, id, conn, is_head);
+            serve_thumb(st, root, id, req, conn);
         },
         Route.Subtitle(id, index) => {
-            serve_subtitle(st, root, id, index, conn, is_head);
+            serve_subtitle(st, root, id, index, req, conn);
         },
         Route.Events => {
             events.serve_sse(hub, conn);
@@ -148,31 +148,24 @@ fn dispatch(st: Store, hub: Hub, rooms: Rooms, root: string, req: webserver.Requ
             room.serve_room(rooms, name, req, conn);
         },
         Route.NotFound => {
-            send_simple(conn, webserver.text(404, "not found\n"));
+            send_simple(req, conn, webserver.text(404, "not found\n"));
         },
     }
 }
 
 // Sirve el fichero de un item por id, con Range: éste es el camino caliente.
-fn serve_item(
-    st: Store,
-    root: string,
-    id: string,
-    req: webserver.Request,
-    conn: int,
-    is_head: bool
-) {
+fn serve_item(st: Store, root: string, id: string, req: webserver.Request, conn: int) {
     match (store.find_by_id(st, id)) {
         Option.None => {
-            send_not_found(conn, id);
+            send_not_found(req, conn, id);
         },
         Option.Some(it) => {
             match (scan.safe_path(root, it.rel)) {
                 Result.Err(e) => {
-                    send_simple(conn, webserver.text(404, "${e}\n"));
+                    send_simple(req, conn, webserver.text(404, "${e}\n"));
                 },
                 Result.Ok(path) => {
-                    match (serve_media.serve_file(conn, path, it.mime, req, is_head)) {
+                    match (serve_media.serve_file(conn, path, it.mime, req)) {
                         Result.Ok(sent) => {
                             log_line(req, sent.status, sent.length);
                         },
@@ -188,20 +181,20 @@ fn serve_item(
 }
 
 // Miniatura: PNG reescalado, carátula embebida, o 404 si el item no tiene ninguna.
-fn serve_thumb(st: Store, root: string, id: string, conn: int, is_head: bool) {
+fn serve_thumb(st: Store, root: string, id: string, req: webserver.Request, conn: int) {
     match (store.find_by_id(st, id)) {
         Option.None => {
-            send_not_found(conn, id);
+            send_not_found(req, conn, id);
         },
         Option.Some(it) => {
             match (scan.safe_path(root, it.rel)) {
                 Result.Err(e) => {
-                    send_simple(conn, webserver.text(404, "${e}\n"));
+                    send_simple(req, conn, webserver.text(404, "${e}\n"));
                 },
                 Result.Ok(path) => {
                     match (thumbs.thumbnail(root, path, it)) {
                         Option.None => {
-                            send_simple(conn, webserver.text(404, "no thumbnail\n"));
+                            send_simple(req, conn, webserver.text(404, "no thumbnail\n"));
                         },
                         Option.Some(thumb) => {
                             let mime: string = match (from_utf8(thumb[0])) {
@@ -211,10 +204,7 @@ fn serve_thumb(st: Store, root: string, id: string, conn: int, is_head: bool) {
                             var r: webserver.Response = webserver.bytes_response(200, thumb[1]);
                             r.headers.insert("Content-Type", mime);
                             r.headers.insert("Cache-Control", "private, max-age=86400");
-                            if (is_head) {
-                                r.body = b"";
-                            }
-                            send_simple(conn, r);
+                            send_simple(req, conn, r);
                         },
                     }
                 },
@@ -225,34 +215,38 @@ fn serve_thumb(st: Store, root: string, id: string, conn: int, is_head: bool) {
 
 // Una pista de subtítulos, siempre como WebVTT: un .srt se convierte al vuelo porque el
 // <track> del navegador no sabe leerlo.
-fn serve_subtitle(st: Store, root: string, id: string, index: int, conn: int, is_head: bool) {
+fn serve_subtitle(
+    st: Store,
+    root: string,
+    id: string,
+    index: int,
+    req: webserver.Request,
+    conn: int
+) {
     match (store.find_by_id(st, id)) {
         Option.None => {
-            send_not_found(conn, id);
+            send_not_found(req, conn, id);
         },
         Option.Some(it) => {
             if (index < 0 || index >= it.tracks.len()) {
-                send_simple(conn, webserver.text(404, "no such subtitle track\n"));
+                send_simple(req, conn, webserver.text(404, "no such subtitle track\n"));
                 return;
             }
             let track: Track = it.tracks[index];
             match (scan.safe_path(root, track.rel)) {
                 Result.Err(e) => {
-                    send_simple(conn, webserver.text(404, "${e}\n"));
+                    send_simple(req, conn, webserver.text(404, "${e}\n"));
                 },
                 Result.Ok(path) => {
                     match (subtitles.load_as_vtt(path, track.format)) {
                         Result.Err(e) => {
-                            send_simple(conn, webserver.text(500, "${e}\n"));
+                            send_simple(req, conn, webserver.text(500, "${e}\n"));
                         },
                         Result.Ok(vtt) => {
                             var r: webserver.Response = webserver.text(200, vtt);
                             r.headers.insert("Content-Type", "text/vtt; charset=utf-8");
                             r.headers.insert("Cache-Control", "private, max-age=3600");
-                            if (is_head) {
-                                r.body = b"";
-                            }
-                            send_simple(conn, r);
+                            send_simple(req, conn, r);
                         },
                     }
                 },
@@ -266,44 +260,19 @@ fn serve_subtitle(st: Store, root: string, id: string, index: int, conn: int, is
 // Los assets de la UI se sirven con el mount de `std/embed` del paquete: saneo de la
 // ruta, ETag de contenido, 304 y MIME por extensión, en disco bajo `ray run` y horneados
 // en el binario nativo. La petición se reescribe para que `/` sea `/assets/index.html`.
-fn send_asset(conn: int, name: string, req: webserver.Request, is_head: bool) {
+fn send_asset(conn: int, name: string, req: webserver.Request) {
     req.path = "/assets/" + name;
-    let r: webserver.Response = webserver.static_mount_embedded("/assets/", "assets", req);
-    if (is_head && r.body.len() > 0) {
-        send_simple(conn, head_of(r));
-        return;
-    }
-    send_simple(conn, r);
+    send_simple(req, conn, webserver.static_mount_embedded("/assets/", "assets", req));
 }
 
-// Un HEAD: las cabeceras de `r` con su Content-Length, sin cuerpo. Hace falta el rodeo
-// del canal vacío porque `send_response` calcularía Content-Length: 0 (ver serve_media).
-fn head_of(r: webserver.Response) -> webserver.Response {
-    let empty: Channel<bytes> = Channel.new();
-    close(empty);
-    let head: webserver.Response = webserver.stream_response_len(r.status, empty, r.body.len());
-    let ks: [string] = r.headers.keys();
-    var i: int = 0;
-    while (i < ks.len()) {
-        match (r.headers.get(ks[i])) {
-            Option.Some(v) => {
-                head.headers.insert(ks[i], v);
-            },
-            Option.None => { },
-        }
-        i = i + 1;
-    }
-    head
-}
-
-fn send_not_found(conn: int, id: string) {
+fn send_not_found(req: webserver.Request, conn: int, id: string) {
     var r: webserver.Response = webserver.json_response(api.error_json("no such item: ${id}"));
     r.status = 404;
-    send_simple(conn, r);
+    send_simple(req, conn, r);
 }
 
-fn send_simple(conn: int, r: webserver.Response) {
-    match (webserver.send_response(conn, r)) {
+fn send_simple(req: webserver.Request, conn: int, r: webserver.Response) {
+    match (webserver.send_response_for(req, conn, r)) {
         Result.Ok(_) => { },
         Result.Err(e) => {
             eprint("send: ${e}");

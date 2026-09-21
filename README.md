@@ -88,7 +88,7 @@ actores y se habla con ellos por canales:
 | `src/router.ray` | ruta → `Route` tipada, query string |
 | `src/catalog/` | `scan` (árbol y rutas seguras), `library` (modelo y JSON), `indexer` (escaneo + metadatos), `store` (el actor) |
 | `src/meta/` | `binary`, `id3`, `mp4`, `wav`, `imagemeta`, `probe` |
-| `src/http/` | `serve_media` (MIME del índice, HEAD y log sobre `webserver.serve_file`), `api` (JSON) |
+| `src/http/` | `serve_media` (MIME del índice y log sobre `webserver.serve_file`), `api` (JSON) |
 | `src/live/` | `events` (SSE + vigilante), `room` (salas WebSocket) |
 | `src/subtitles.ray` | descubrimiento de pistas y conversión SRT → WebVTT |
 | `src/thumbs.ray` | reescalado PNG y caché |
@@ -142,8 +142,6 @@ curl -s "localhost:8080/subs/<id>/0" | head -4
 - Las miniaturas de JPEG son el fichero original: `std/image` sólo decodifica PNG.
 - Una petición por conexión (sin keep-alive), así que cada salto en la barra abre una conexión
   nueva. El límite es de 128 conexiones simultáneas, y cada conexión larga (SSE, sala) ocupa una.
-- Los `HEAD` de `/media` los responde este proyecto a mano: el emisor del paquete no conoce el
-  método y mandaría el cuerpo (hallazgo 23).
 - La duración de un MP3 VBR es una estimación; la de MP4 y WAV es exacta.
 - Los subtítulos son ficheros hermanos: no se extraen las pistas incrustadas en el contenedor
   (haría falta demuxar MP4/Matroska).
