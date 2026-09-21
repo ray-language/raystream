@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>raystream</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<header>
+  <h1>raystream</h1>
+  <div id="stats" class="stats">loading…</div>
+  <div class="room">
+    <input id="room-name" type="text" placeholder="room" value="salon" size="8">
+    <button id="room-toggle">Join room</button>
+    <span id="room-state" class="dot" title="not connected"></span>
+  </div>
+</header>
+<main>
+  <section id="stage" class="stage" hidden></section>
+  <nav class="filters">
+    <input id="q" type="search" placeholder="Search the library…" autocomplete="off">
+    <button data-kind="" class="on">All</button>
+    <button data-kind="video">Video</button>
+    <button data-kind="audio">Audio</button>
+    <button data-kind="image">Images</button>
+  </nav>
+  <ul id="grid" class="grid"></ul>
+</main>
+<script src="/assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,316 @@
+// raystream — un servidor de medios personal escrito en raylang.
+//
+// Un único puerto sobre `webserver.serve_raw`: la conexión cruda es lo que permite
+// escribir un 206 con Content-Length exacto (streaming de vídeo con seek), abrir un
+// stream SSE y hacer el upgrade a WebSocket. El enrutado y el catálogo son nuestros.
+//
+// Fibras: una por conexión, más el actor del catálogo, el hub de eventos, el vigilante
+// del directorio y el actor de salas. Ninguna comparte memoria: todo por canales.
+import std/net;
+import catalog/indexer;
+import catalog/library;
+import catalog/scan;
+import catalog/store;
+import config;
+import http/api;
+import http/serve_media;
+import live/events;
+import live/room;
+import net/webserver;
+import router;
+import samples;
+import subtitles;
+import thumbs;
+from catalog/library import Item, Track;
+from catalog/store import Store;
+from config import Config;
+from live/events import Hub;
+from live/room import Rooms;
+from router import Route;
+
+/// Connections served at once; beyond this the accept loop parks and the kernel's
+/// backlog holds the rest. Long-lived connections (SSE, rooms) occupy a slot each.
+const MAX_CONNS: int = 128;
+
+/// How long a client has to send its request line and headers.
+const REQUEST_TIMEOUT_MS: int = 15000;
+
+fn main() -> int {
+    match (config.parse(args())) {
+        Result.Err(message) => {
+            print(message);
+            if (message.starts_with("raystream")) { 0 } else { 2 }
+        },
+        Result.Ok(cfg) => {
+            match (boot(cfg)) {
+                Result.Ok(code) => code,
+                Result.Err(e) => {
+                    eprint("raystream: ${e}");
+                    1
+                },
+            }
+        },
+    }
+}
+
+// Prepara la biblioteca, levanta los actores y arranca el servidor.
+fn boot(cfg: Config) -> Result<int, string> {
+    let root: string = config.resolve_dir(cfg)?;
+    let created: int = samples.populate(root)?;
+    if (created > 0) {
+        print("seeded ${created} sample files in ${root}");
+    }
+    let items: [Item] = indexer.build_timed(root)?;
+    if (cfg.scan_only) {
+        print_summary(items);
+        return Result.Ok(0);
+    }
+
+    let st: Store = store.start(items);
+    let hub: Hub = events.start();
+    let rooms: Rooms = room.start();
+    events.watch_library(hub, st, root);
+
+    // `serve_raw_with` da el bucle de accept, los límites y el cierre de la conexión; el
+    // handler va escrito INLINE en la llamada, que es la forma que también compila a
+    // binario nativo (NOTES-raylang.md, hallazgo 5: un closure guardado en una variable
+    // no cruza a las fibras de conexión).
+    let limits: webserver.Limits = webserver.default_limits();
+    limits.max_conns = MAX_CONNS;
+    limits.read_timeout_millis = REQUEST_TIMEOUT_MS;
+    print("raystream listening on http://${cfg.host}:${cfg.port}  (library: ${root})");
+    webserver.serve_raw_limits(cfg.host, cfg.port, limits, fn(req: webserver.Request, conn: int) {
+        dispatch(st, hub, rooms, root, req, conn);
+    })
+}
+
+fn print_summary(items: [Item]) {
+    var i: int = 0;
+    while (i < items.len()) {
+        let it: Item = items[i];
+        let extra: string = if (it.duration_ms > 0) {
+            "${it.duration_ms}ms"
+        } else if (it.width > 0) {
+            "${it.width}x${it.height}"
+        } else {
+            "-"
+        };
+        print("  ${it.id}  ${library.kind_name(it.kind)}  ${it.size}  ${extra}  ${it.rel}");
+        i = i + 1;
+    }
+}
+
+// El despachador: una ruta tipada y su respuesta. Cada conexión corre en su propia fibra.
+fn dispatch(st: Store, hub: Hub, rooms: Rooms, root: string, req: webserver.Request, conn: int) {
+    let is_head: bool = req.method == "HEAD";
+    if (req.method != "GET" && !is_head) {
+        send_simple(conn, webserver.text(405, "method not allowed\n"));
+        return;
+    }
+    match (router.resolve(req.path)) {
+        Route.Home => {
+            send_asset(conn, "index.html", req, is_head);
+        },
+        Route.Asset(name) => {
+            send_asset(conn, name, req, is_head);
+        },
+        Route.ApiLibrary => {
+            let kind: string = router.query_param(req.query, "kind");
+            let q: string = router.query_param(req.query, "q");
+            send_simple(conn, webserver.json_response(api.library_json(st, kind, q)));
+        },
+        Route.ApiStats => {
+            send_simple(conn, webserver.json_response(api.stats_json(st, root)));
+        },
+        Route.ApiItem(id) => {
+            match (api.item_json(st, id)) {
+                Option.Some(body) => {
+                    send_simple(conn, webserver.json_response(body));
+                },
+                Option.None => {
+                    send_not_found(conn, id);
+                },
+            }
+        },
+        Route.Media(id) => {
+            serve_item(st, root, id, req, conn, is_head);
+        },
+        Route.Thumb(id) => {
+            serve_thumb(st, root, id, conn, is_head);
+        },
+        Route.Subtitle(id, index) => {
+            serve_subtitle(st, root, id, index, conn, is_head);
+        },
+        Route.Events => {
+            events.serve_sse(hub, conn);
+        },
+        Route.Room(name) => {
+            room.serve_room(rooms, name, req, conn);
+        },
+        Route.NotFound => {
+            send_simple(conn, webserver.text(404, "not found\n"));
+        },
+    }
+}
+
+// Sirve el fichero de un item por id, con Range: éste es el camino caliente.
+fn serve_item(
+    st: Store,
+    root: string,
+    id: string,
+    req: webserver.Request,
+    conn: int,
+    is_head: bool
+) {
+    match (store.find_by_id(st, id)) {
+        Option.None => {
+            send_not_found(conn, id);
+        },
+        Option.Some(it) => {
+            match (scan.safe_path(root, it.rel)) {
+                Result.Err(e) => {
+                    send_simple(conn, webserver.text(404, "${e}\n"));
+                },
+                Result.Ok(path) => {
+                    match (serve_media.serve_file(conn, path, it.mime, req, is_head)) {
+                        Result.Ok(sent) => {
+                            log_line(req, sent.status, sent.length);
+                        },
+                        Result.Err(e) => {
+                            // Un cliente que corta a mitad (cada seek lo hace) no es un fallo.
+                            eprint("media ${id}: ${e}");
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// Miniatura: PNG reescalado, carátula embebida, o 404 si el item no tiene ninguna.
+fn serve_thumb(st: Store, root: string, id: string, conn: int, is_head: bool) {
+    match (store.find_by_id(st, id)) {
+        Option.None => {
+            send_not_found(conn, id);
+        },
+        Option.Some(it) => {
+            match (scan.safe_path(root, it.rel)) {
+                Result.Err(e) => {
+                    send_simple(conn, webserver.text(404, "${e}\n"));
+                },
+                Result.Ok(path) => {
+                    match (thumbs.thumbnail(root, path, it)) {
+                        Option.None => {
+                            send_simple(conn, webserver.text(404, "no thumbnail\n"));
+                        },
+                        Option.Some(thumb) => {
+                            let mime: string = match (from_utf8(thumb[0])) {
+                                Result.Ok(m) => m,
+                                Result.Err(_) => "application/octet-stream",
+                            };
+                            var r: webserver.Response = webserver.bytes_response(200, thumb[1]);
+                            r.headers.insert("Content-Type", mime);
+                            r.headers.insert("Cache-Control", "private, max-age=86400");
+                            if (is_head) {
+                                r.body = b"";
+                            }
+                            send_simple(conn, r);
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// Una pista de subtítulos, siempre como WebVTT: un .srt se convierte al vuelo porque el
+// <track> del navegador no sabe leerlo.
+fn serve_subtitle(st: Store, root: string, id: string, index: int, conn: int, is_head: bool) {
+    match (store.find_by_id(st, id)) {
+        Option.None => {
+            send_not_found(conn, id);
+        },
+        Option.Some(it) => {
+            if (index < 0 || index >= it.tracks.len()) {
+                send_simple(conn, webserver.text(404, "no such subtitle track\n"));
+                return;
+            }
+            let track: Track = it.tracks[index];
+            match (scan.safe_path(root, track.rel)) {
+                Result.Err(e) => {
+                    send_simple(conn, webserver.text(404, "${e}\n"));
+                },
+                Result.Ok(path) => {
+                    match (subtitles.load_as_vtt(path, track.format)) {
+                        Result.Err(e) => {
+                            send_simple(conn, webserver.text(500, "${e}\n"));
+                        },
+                        Result.Ok(vtt) => {
+                            var r: webserver.Response = webserver.text(200, vtt);
+                            r.headers.insert("Content-Type", "text/vtt; charset=utf-8");
+                            r.headers.insert("Cache-Control", "private, max-age=3600");
+                            if (is_head) {
+                                r.body = b"";
+                            }
+                            send_simple(conn, r);
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+// Los assets de la UI viven en `assets/` y viajan por `std/embed`: en disco bajo `ray run`
+// y horneados dentro del binario con `ray build --native`.
+// Los assets de la UI se sirven con el mount de `std/embed` del paquete: saneo de la
+// ruta, ETag de contenido, 304 y MIME por extensión, en disco bajo `ray run` y horneados
+// en el binario nativo. La petición se reescribe para que `/` sea `/assets/index.html`.
+fn send_asset(conn: int, name: string, req: webserver.Request, is_head: bool) {
+    req.path = "/assets/" + name;
+    let r: webserver.Response = webserver.static_mount_embedded("/assets/", "assets", req);
+    if (is_head && r.body.len() > 0) {
+        send_simple(conn, head_of(r));
+        return;
+    }
+    send_simple(conn, r);
+}
+
+// Un HEAD: las cabeceras de `r` con su Content-Length, sin cuerpo. Hace falta el rodeo
+// del canal vacío porque `send_response` calcularía Content-Length: 0 (ver serve_media).
+fn head_of(r: webserver.Response) -> webserver.Response {
+    let empty: Channel<bytes> = Channel.new();
+    close(empty);
+    let head: webserver.Response = webserver.stream_response_len(r.status, empty, r.body.len());
+    let ks: [string] = r.headers.keys();
+    var i: int = 0;
+    while (i < ks.len()) {
+        match (r.headers.get(ks[i])) {
+            Option.Some(v) => {
+                head.headers.insert(ks[i], v);
+            },
+            Option.None => { },
+        }
+        i = i + 1;
+    }
+    head
+}
+
+fn send_not_found(conn: int, id: string) {
+    var r: webserver.Response = webserver.json_response(api.error_json("no such item: ${id}"));
+    r.status = 404;
+    send_simple(conn, r);
+}
+
+fn send_simple(conn: int, r: webserver.Response) {
+    match (webserver.send_response(conn, r)) {
+        Result.Ok(_) => { },
+        Result.Err(e) => {
+            eprint("send: ${e}");
+        },
+    }
+}
+
+fn log_line(req: webserver.Request, status: int, sent: int) {
+    print("${req.method} ${req.path} → ${status} (${sent} bytes)");
+}

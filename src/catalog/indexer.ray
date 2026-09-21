@@ -1,0 +1,33 @@
+// El indexado completo: recorrer el árbol y sacarle los metadatos a cada fichero.
+// Es lo que corre al arrancar y lo que vuelve a correr cuando el vigilante ve un cambio.
+import std/time;
+import catalog/scan;
+import meta/probe;
+from catalog/library import Item;
+
+/// Scans `root` and enriches every item with its metadata. Returns the items ready for
+/// the catalog actor.
+pub fn build(root: string) -> Result<[Item], string> {
+    let items: [Item] = scan.scan(root)?;
+    var i: int = 0;
+    while (i < items.len()) {
+        let it: Item = items[i];
+        match (scan.safe_path(root, it.rel)) {
+            Result.Ok(path) => {
+                probe.probe(path, it);
+            },
+            Result.Err(_) => { },
+        }
+        i = i + 1;
+    }
+    Result.Ok(items)
+}
+
+/// Same as `build`, reporting how long it took in milliseconds.
+pub fn build_timed(root: string) -> Result<[Item], string> {
+    let started: int = time.now();
+    let items: [Item] = build(root)?;
+    let elapsed: int = time.now() - started;
+    print("indexed ${items.len()} item(s) from ${root} in ${elapsed} ms");
+    Result.Ok(items)
+}

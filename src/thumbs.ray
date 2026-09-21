@@ -1,0 +1,207 @@
+// Miniaturas. Para PNG se redimensiona de verdad (filtro de caja sobre RGBA) y el
+// resultado se cachea en disco; para audio con carátula embebida se sirve la carátula.
+//
+// Los JPEG se sirven tal cual: `std/image` sólo decodifica PNG (NOTES-raylang.md,
+// hallazgo 8), así que no hay forma de reescalarlos sin escribir un decodificador JPEG.
+import std/fs;
+import std/image;
+import catalog/library;
+import meta/probe;
+from catalog/library import Item, Kind;
+
+/// The longest side of a generated thumbnail, in pixels.
+pub const MAX_SIDE: int = 400;
+
+/// Where thumbnails are cached, relative to the library root.
+pub const CACHE_SUBDIR: string = ".raystream/thumbs";
+
+/// Returns `[mime, data]` for an item's thumbnail, or `None` when it has none (video,
+/// audio without cover art). PNGs are downscaled and cached; other images are returned
+/// untouched.
+pub fn thumbnail(root: string, path: string, it: Item) -> Option<[bytes]> {
+    match (it.kind) {
+        Kind.Video => Option.None,
+        Kind.Audio => cover(path),
+        Kind.Image => image_thumb(root, path, it),
+    }
+}
+
+fn cover(path: string) -> Option<[bytes]> {
+    let found: [bytes] = probe.cover_of(path);
+    if (found[1].len() == 0) {
+        Option.None
+    } else {
+        Option.Some(found)
+    }
+}
+
+fn image_thumb(root: string, path: string, it: Item) -> Option<[bytes]> {
+    if (library.extension_of(it.rel) != "png") {
+        // Sin decodificador JPEG/WebP/GIF: el original es la miniatura.
+        match (fs.read_file_bytes(path)) {
+            Result.Ok(data) => Option.Some([it.mime.to_bytes(), data]),
+            Result.Err(_) => Option.None,
+        }
+    } else {
+        Option.Some([b"image/png", png_thumb(root, path, it)])
+    }
+}
+
+// Devuelve la miniatura PNG cacheada, generándola la primera vez. Si algo falla en el
+// camino, el original sirve igual: una miniatura nunca debe romper la galería.
+fn png_thumb(root: string, path: string, it: Item) -> bytes {
+    let cache_dir: string = root + "/" + CACHE_SUBDIR;
+    let cached: string = "${cache_dir}/${it.id}-${it.mtime_ms}.png";
+    match (fs.read_file_bytes(cached)) {
+        Result.Ok(data) => {
+            return data;
+        },
+        Result.Err(_) => { },
+    }
+    let original: bytes = match (fs.read_file_bytes(path)) {
+        Result.Ok(data) => data,
+        Result.Err(_) => b"",
+    };
+    if (original.len() == 0) {
+        return original;
+    }
+    match (image.decode_png(original)) {
+        Result.Err(_) => original,
+        Result.Ok(img) => {
+            let small: image.Image = downscale(img, MAX_SIDE);
+            match (image.encode_png(small)) {
+                Result.Err(_) => original,
+                Result.Ok(encoded) => {
+                    // La caché es best-effort: si el disco falla, se sirve igualmente.
+                    match (fs.mkdir(cache_dir)) {
+                        Result.Ok(_) => {
+                            fs.write_file_bytes(cached, encoded).unwrap_or(0);
+                        },
+                        Result.Err(_) => { },
+                    }
+                    encoded
+                },
+            }
+        },
+    }
+}
+
+/// Downscales an RGBA image so its longest side is at most `max_side`, averaging each
+/// source block (a box filter: cheap, and much better than dropping pixels).
+pub fn downscale(img: image.Image, max_side: int) -> image.Image {
+    let longest: int = if (img.width > img.height) { img.width } else { img.height };
+    if (longest <= max_side || img.width <= 0 || img.height <= 0) {
+        return img;
+    }
+    let w: int = at_least_one(img.width * max_side / longest);
+    let h: int = at_least_one(img.height * max_side / longest);
+    var out: [int] = [];
+    var y: int = 0;
+    while (y < h) {
+        let sy0: int = y * img.height / h;
+        let sy1: int = at_least(sy0 + 1, (y + 1) * img.height / h);
+        var x: int = 0;
+        while (x < w) {
+            let sx0: int = x * img.width / w;
+            let sx1: int = at_least(sx0 + 1, (x + 1) * img.width / w);
+            var r: int = 0;
+            var g: int = 0;
+            var b: int = 0;
+            var a: int = 0;
+            var n: int = 0;
+            var sy: int = sy0;
+            while (sy < sy1) {
+                var sx: int = sx0;
+                while (sx < sx1) {
+                    let at: int = (sy * img.width + sx) * 4;
+                    r = r + img.pixels[at];
+                    g = g + img.pixels[at + 1];
+                    b = b + img.pixels[at + 2];
+                    a = a + img.pixels[at + 3];
+                    n = n + 1;
+                    sx = sx + 1;
+                }
+                sy = sy + 1;
+            }
+            if (n == 0) {
+                n = 1;
+            }
+            out.push(r / n);
+            out.push(g / n);
+            out.push(b / n);
+            out.push(a / n);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    image.Image { width: w, height: h, pixels: bytes_of(out) }
+}
+
+fn at_least_one(v: int) -> int {
+    if (v < 1) { 1 } else { v }
+}
+
+fn at_least(floor_value: int, v: int) -> int {
+    if (v < floor_value) { floor_value } else { v }
+}
+
+@test
+fn downscaling_keeps_the_aspect_ratio() {
+    let img: image.Image = solid(800, 400, 10, 20, 30);
+    let small: image.Image = downscale(img, 400);
+    assert_eq(small.width, 400);
+    assert_eq(small.height, 200);
+    assert_eq(small.pixels.len(), 400 * 200 * 4);
+    // Una imagen de color plano sigue siendo del mismo color tras promediar.
+    assert_eq(small.pixels[0], 10);
+    assert_eq(small.pixels[1], 20);
+    assert_eq(small.pixels[2], 30);
+    assert_eq(small.pixels[3], 255);
+}
+
+@test
+fn small_images_are_left_alone() {
+    let img: image.Image = solid(100, 50, 1, 2, 3);
+    let same: image.Image = downscale(img, 400);
+    assert_eq(same.width, 100);
+    assert_eq(same.height, 50);
+}
+
+@test
+fn thumbnails_are_cached_on_disk() {
+    let root: string = fs.make_temp_dir("raystream_thumbs").unwrap_or("");
+    let img: image.Image = solid(600, 600, 200, 100, 50);
+    let png: bytes = image.encode_png(img).unwrap_or(b"");
+    fs.write_file_bytes(root + "/big.png", png).unwrap_or(0);
+    var it: Item = library.new_item("big.png", Kind.Image, png.len(), 7);
+
+    match (thumbnail(root, root + "/big.png", it)) {
+        Option.Some(first) => {
+            assert_eq(first[0], b"image/png");
+            let decoded: image.Image = image.decode_png(first[1]).unwrap_or(solid(1, 1, 0, 0, 0));
+            assert_eq(decoded.width, MAX_SIDE);
+            // La segunda vez sale de la caché: el fichero existe y el contenido coincide.
+            let cached: string = "${root}/${CACHE_SUBDIR}/${it.id}-7.png";
+            assert(fs.exists(cached));
+            match (thumbnail(root, root + "/big.png", it)) {
+                Option.Some(second) => assert_eq(second[1], first[1]),
+                Option.None => panic("cached thumbnail disappeared"),
+            }
+        },
+        Option.None => panic("a png should have a thumbnail"),
+    }
+    fs.remove_all(root).unwrap_or(0);
+}
+
+fn solid(w: int, h: int, r: int, g: int, b: int) -> image.Image {
+    var px: [int] = [];
+    var i: int = 0;
+    while (i < w * h) {
+        px.push(r);
+        px.push(g);
+        px.push(b);
+        px.push(255);
+        i = i + 1;
+    }
+    image.Image { width: w, height: h, pixels: bytes_of(px) }
+}

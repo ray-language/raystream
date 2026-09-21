@@ -1,0 +1,317 @@
+// ID3v2 (2.2, 2.3 y 2.4) + cabecera de trama MPEG: título, artista, álbum, carátula y
+// una estimación de duración para MP3.
+import meta/binary;
+
+/// The tags of an MP3, plus the embedded cover when there is one.
+pub struct Tags {
+    title: string,
+    artist: string,
+    album: string,
+    cover: bytes,
+    cover_mime: string,
+}
+
+/// An empty tag set (what a file without ID3 yields).
+pub fn empty_tags() -> Tags {
+    Tags { title: "", artist: "", album: "", cover: b"", cover_mime: "" }
+}
+
+/// Size in octets of the ID3v2 tag at the start of the file (0 when there is none).
+/// The audio frames begin right after it.
+pub fn tag_size(data: bytes) -> int {
+    if (data.len() < 10 || !data.starts_with(b"ID3")) {
+        return 0;
+    }
+    10 + binary.synchsafe(data, 6)
+}
+
+/// Parses the ID3v2 tag at the start of `data`. `data` only needs to cover the tag
+/// itself; `tag_size` says how much that is.
+pub fn parse(data: bytes) -> Tags {
+    var tags: Tags = empty_tags();
+    let total: int = tag_size(data);
+    if (total == 0) {
+        return tags;
+    }
+    let major: int = data[3];
+    // El tamaño de un identificador de trama y de su cabecera cambió en 2.2.
+    let id_len: int = if (major <= 2) { 3 } else { 4 };
+    let header_len: int = if (major <= 2) { 6 } else { 10 };
+
+    var pos: int = 10;
+    if (major >= 3 && (data[5] / 64) % 2 == 1) {
+        // Cabecera extendida: su tamaño va en los cuatro primeros octetos.
+        pos = pos + binary.be_u32(data, pos) + 4;
+    }
+    let limit: int = if (total < data.len()) { total } else { data.len() };
+    while (pos + header_len <= limit) {
+        let id: string = frame_id(data, pos, id_len);
+        if (id == "" || id.starts_with("\0")) {
+            // Relleno: el resto del tag son ceros.
+            return tags;
+        }
+        let size: int = frame_size(data, pos, major, id_len);
+        let body: int = pos + header_len;
+        if (size <= 0 || body + size > limit) {
+            return tags;
+        }
+        let payload: bytes = data.sub_bytes(body, body + size);
+        if (id == "TIT2" || id == "TT2") {
+            tags.title = text_of(payload);
+        } else if (id == "TPE1" || id == "TP1") {
+            tags.artist = text_of(payload);
+        } else if (id == "TALB" || id == "TAL") {
+            tags.album = text_of(payload);
+        } else if ((id == "APIC" || id == "PIC") && tags.cover.len() == 0) {
+            let picture: [bytes] = picture_of(payload, id == "PIC");
+            tags.cover_mime = utf8_or(picture[0], "image/jpeg");
+            tags.cover = picture[1];
+        }
+        pos = body + size;
+    }
+    tags
+}
+
+fn frame_id(data: bytes, pos: int, id_len: int) -> string {
+    match (from_utf8(data.sub_bytes(pos, pos + id_len))) {
+        Result.Ok(s) => s,
+        Result.Err(_) => "",
+    }
+}
+
+// 2.4 usa enteros synchsafe para el tamaño de trama; 2.3 un u32 normal; 2.2, tres octetos.
+fn frame_size(data: bytes, pos: int, major: int, id_len: int) -> int {
+    if (major <= 2) {
+        (data[pos + 3] * 256 + data[pos + 4]) * 256 + data[pos + 5]
+    } else if (major >= 4) {
+        binary.synchsafe(data, pos + id_len)
+    } else {
+        binary.be_u32(data, pos + id_len)
+    }
+}
+
+// El primer octeto de una trama de texto es la codificación.
+fn text_of(payload: bytes) -> string {
+    if (payload.len() < 2) {
+        return "";
+    }
+    let encoding: int = payload[0];
+    let body: bytes = trim_nulls(payload.sub_bytes(1, payload.len()));
+    if (encoding == 0) {
+        latin1(body)
+    } else if (encoding == 3) {
+        utf8_or(body, "")
+    } else {
+        utf16(body)
+    }
+}
+
+// ISO-8859-1 → UTF-8 (cada octeto es un punto de código).
+fn latin1(b: bytes) -> string {
+    var out: string = "";
+    var i: int = 0;
+    while (i < b.len()) {
+        out = out + char_or_empty(b[i]);
+        i = i + 1;
+    }
+    out.trim()
+}
+
+// `char_from_code` da Option<char>: un punto de código inválido se descarta.
+fn char_or_empty(code: int) -> string {
+    match (char_from_code(code)) {
+        Option.Some(c) => to_string(c),
+        Option.None => "",
+    }
+}
+
+// UTF-16 con o sin BOM: se queda con los puntos de código del plano básico.
+fn utf16(b: bytes) -> string {
+    var i: int = 0;
+    var little: bool = false;
+    if (b.len() >= 2 && b[0] == 0xFF && b[1] == 0xFE) {
+        little = true;
+        i = 2;
+    } else if (b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF) {
+        i = 2;
+    }
+    var out: string = "";
+    while (i + 1 < b.len()) {
+        let code: int = if (little) { b[i] + b[i + 1] * 256 } else { b[i] * 256 + b[i + 1] };
+        if (code != 0) {
+            out = out + char_or_empty(code);
+        }
+        i = i + 2;
+    }
+    out.trim()
+}
+
+// APIC: codificación, MIME terminado en 0, tipo de imagen, descripción terminada en 0, datos.
+// PIC (2.2) lleva un tipo de imagen de tres letras en lugar del MIME.
+fn picture_of(payload: bytes, short_form: bool) -> [bytes] {
+    if (payload.len() < 4) {
+        return [b"", b""];
+    }
+    let encoding: int = payload[0];
+    var pos: int = 1;
+    var mime: bytes = b"image/jpeg";
+    if (short_form) {
+        let kind: string = utf8_or(payload.sub_bytes(1, 4), "JPG");
+        mime = if (kind.to_upper() == "PNG") { b"image/png" } else { b"image/jpeg" };
+        pos = 4;
+    } else {
+        let stop: int = index_of_zero(payload, pos);
+        if (stop < 0) {
+            return [b"", b""];
+        }
+        mime = payload.sub_bytes(pos, stop);
+        pos = stop + 1;
+    }
+    // Tipo de imagen (1 octeto) y descripción terminada en 0 (doble 0 en UTF-16).
+    pos = pos + 1;
+    if (encoding == 1 || encoding == 2) {
+        let stop: int = index_of_double_zero(payload, pos);
+        if (stop < 0) {
+            return [b"", b""];
+        }
+        pos = stop + 2;
+    } else {
+        let stop: int = index_of_zero(payload, pos);
+        if (stop < 0) {
+            return [b"", b""];
+        }
+        pos = stop + 1;
+    }
+    if (pos >= payload.len()) {
+        return [b"", b""];
+    }
+    [mime, payload.sub_bytes(pos, payload.len())]
+}
+
+fn index_of_zero(b: bytes, from_pos: int) -> int {
+    var i: int = from_pos;
+    while (i < b.len()) {
+        if (b[i] == 0) {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+fn index_of_double_zero(b: bytes, from_pos: int) -> int {
+    var i: int = from_pos;
+    while (i + 1 < b.len()) {
+        if (b[i] == 0 && b[i + 1] == 0) {
+            return i;
+        }
+        i = i + 2;
+    }
+    0 - 1
+}
+
+fn trim_nulls(b: bytes) -> bytes {
+    var end: int = b.len();
+    while (end > 0 && b[end - 1] == 0) {
+        end = end - 1;
+    }
+    b.sub_bytes(0, end)
+}
+
+fn utf8_or(b: bytes, fallback: string) -> string {
+    match (from_utf8(b)) {
+        Result.Ok(s) => s.trim(),
+        Result.Err(_) => fallback,
+    }
+}
+
+// --- Duración estimada de un MP3 ---
+
+/// Estimates the duration of a CBR MP3: the first frame header gives the bitrate, and
+/// the audio length divided by it is the duration. VBR files are approximated.
+/// `head` must start at the file's first octet; `file_size` is the whole file.
+pub fn mp3_duration_ms(head: bytes, file_size: int) -> int {
+    let skip: int = tag_size(head);
+    var i: int = skip;
+    // El sincronismo de una trama MPEG son 11 bits a 1.
+    while (i + 3 < head.len()) {
+        if (head[i] == 0xFF && head[i + 1] >= 0xE0) {
+            let kbps: int = bitrate_kbps(head, i);
+            if (kbps > 0) {
+                let audio_bytes: int = file_size - skip;
+                return audio_bytes * 8 / kbps;
+            }
+        }
+        i = i + 1;
+    }
+    0
+}
+
+/// MPEG-1 Layer III bitrate table, in kbps (index 0 and 15 are reserved).
+const BITRATES_KBPS: [int] = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
+
+// El bitrate declarado por la cabecera de trama (la combinación que usa el 99% de los .mp3).
+fn bitrate_kbps(b: bytes, i: int) -> int {
+    let version: int = (b[i + 1] / 8) % 4;  // 3 = MPEG-1
+    let layer: int = (b[i + 1] / 2) % 4;  // 1 = Layer III
+    if (version != 3 || layer != 1) {
+        return 0;
+    }
+    BITRATES_KBPS[b[i + 2] / 16]
+}
+
+@test
+fn reads_v23_text_frames() {
+    let title: bytes = bytes_of([0]) + b"Blue in Green";
+    let artist: bytes = bytes_of([0]) + b"Miles Davis";
+    let frames: bytes = frame("TIT2", title) + frame("TPE1", artist);
+    let tag: bytes = header(frames.len()) + frames;
+
+    let tags: Tags = parse(tag);
+    assert_eq(tags.title, "Blue in Green");
+    assert_eq(tags.artist, "Miles Davis");
+    assert_eq(tags.album, "");
+}
+
+@test
+fn reads_an_embedded_cover() {
+    var apic: bytes = bytes_of([0]) + b"image/png" + bytes_of([0]) + bytes_of([3]);
+    apic = apic + b"front" + bytes_of([0]) + bytes_of([0x89, 0x50, 0x4E, 0x47]);
+    let frames: bytes = frame("APIC", apic);
+    let tags: Tags = parse(header(frames.len()) + frames);
+    assert_eq(tags.cover_mime, "image/png");
+    assert_eq(tags.cover, bytes_of([0x89, 0x50, 0x4E, 0x47]));
+}
+
+@test
+fn a_file_without_id3_is_empty() {
+    let tags: Tags = parse(b"\xff\xfbsome mpeg audio");
+    assert_eq(tags.title, "");
+    assert_eq(tag_size(b"\xff\xfbsome mpeg audio"), 0);
+}
+
+@test
+fn cbr_duration_estimate() {
+    // Trama MPEG-1 Layer III a 128 kbps: 1 048 576 octetos ≈ 65 s.
+    let head: bytes = bytes_of([0xFF, 0xFB, 0x90, 0x0]);
+    let ms: int = mp3_duration_ms(head, 1048576);
+    assert(ms > 64000 && ms < 66000);
+}
+
+// --- Ayudas de los tests ---
+
+fn header(size: int) -> bytes {
+    b"ID3" + bytes_of([3, 0, 0]) + synchsafe_bytes(size)
+}
+
+fn frame(id: string, body: bytes) -> bytes {
+    let n: int = body.len();
+    id.to_bytes()
+        + bytes_of([(n / 16777216) % 256, (n / 65536) % 256, (n / 256) % 256, n % 256])
+        + bytes_of([0, 0])
+        + body
+}
+
+fn synchsafe_bytes(v: int) -> bytes {
+    bytes_of([(v / 2097152) % 128, (v / 16384) % 128, (v / 128) % 128, v % 128])
+}

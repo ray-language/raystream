@@ -1,0 +1,205 @@
+// El segundo paso del indexado: abrir cada fichero lo justo para sacarle los metadatos.
+// Nunca se lee un fichero entero — como mucho, una ventana de cabecera y otra de cola.
+import std/fs;
+import catalog/library;
+import meta/id3;
+import meta/imagemeta;
+import meta/mp4;
+import meta/wav;
+from catalog/library import Item, Kind;
+
+/// How much of the head of a file is read looking for headers.
+pub const HEAD_WINDOW: int = 262144;
+
+/// How much of the tail is read when an MP4 keeps its `moov` at the end.
+pub const TAIL_WINDOW: int = 1048576;
+
+/// Fills the metadata fields of `it` in place (duration, dimensions, tags, cover) by
+/// reading the minimum from `path`. Anything unreadable simply leaves the defaults.
+pub fn probe(path: string, it: Item) {
+    match (it.kind) {
+        Kind.Image => {
+            probe_image(path, it);
+        },
+        Kind.Audio => {
+            probe_audio(path, it);
+        },
+        Kind.Video => {
+            probe_video(path, it);
+        },
+    }
+}
+
+fn probe_image(path: string, it: Item) {
+    let head: bytes = read_window(path, 0, 65536);
+    match (imagemeta.parse(head)) {
+        Option.Some(d) => {
+            it.width = d.width;
+            it.height = d.height;
+        },
+        Option.None => { },
+    }
+}
+
+fn probe_audio(path: string, it: Item) {
+    let ext: string = library.extension_of(it.rel);
+    if (ext == "wav") {
+        match (wav.parse(read_window(path, 0, 4096))) {
+            Option.Some(info) => {
+                it.duration_ms = info.duration_ms;
+            },
+            Option.None => { },
+        }
+        return;
+    }
+    if (ext == "m4a" || ext == "aac") {
+        probe_video(path, it);
+        return;
+    }
+    // MP3 y demás: etiquetas ID3 y duración estimada.
+    let head: bytes = read_window(path, 0, HEAD_WINDOW);
+    let tag_bytes: int = id3.tag_size(head);
+    let tag_data: bytes = if (tag_bytes > head.len()) {
+        read_window(path, 0, tag_bytes)
+    } else {
+        head
+    };
+    let tags: id3.Tags = id3.parse(tag_data);
+    it.title = tags.title;
+    it.artist = tags.artist;
+    it.album = tags.album;
+    it.has_cover = tags.cover.len() > 0;
+    if (ext == "mp3") {
+        it.duration_ms = id3.mp3_duration_ms(head, it.size);
+    }
+}
+
+fn probe_video(path: string, it: Item) {
+    let head: bytes = read_window(path, 0, HEAD_WINDOW);
+    match (mp4.parse(head)) {
+        Option.Some(info) => {
+            apply_mp4(it, info);
+            return;
+        },
+        Option.None => { },
+    }
+    // `moov` al final (ficheros no optimizados para streaming).
+    if (it.size > HEAD_WINDOW) {
+        let from_pos: int = if (it.size > TAIL_WINDOW) { it.size - TAIL_WINDOW } else { 0 };
+        match (mp4.parse(read_window(path, from_pos, TAIL_WINDOW))) {
+            Option.Some(info) => {
+                apply_mp4(it, info);
+            },
+            Option.None => { },
+        }
+    }
+}
+
+fn apply_mp4(it: Item, info: mp4.Mp4Info) {
+    if (info.duration_ms > 0) {
+        it.duration_ms = info.duration_ms;
+    }
+    if (info.width > 0) {
+        it.width = info.width;
+        it.height = info.height;
+    }
+}
+
+/// The embedded cover of an audio file: `[mime, data]`, or two empty values when there
+/// is none. Read on demand by `/thumb`, never kept in the index.
+pub fn cover_of(path: string) -> [bytes] {
+    let head: bytes = read_window(path, 0, HEAD_WINDOW);
+    let tag_bytes: int = id3.tag_size(head);
+    if (tag_bytes == 0) {
+        return [b"", b""];
+    }
+    let tag_data: bytes = if (tag_bytes > head.len()) {
+        read_window(path, 0, tag_bytes)
+    } else {
+        head
+    };
+    let tags: id3.Tags = id3.parse(tag_data);
+    [tags.cover_mime.to_bytes(), tags.cover]
+}
+
+/// Reads at most `max` octets starting at `offset`. Bounded memory by construction:
+/// this is the only door the metadata parsers have to the filesystem.
+pub fn read_window(path: string, offset: int, max: int) -> bytes {
+    match (fs.open(path, "r")) {
+        Result.Err(_) => b"",
+        Result.Ok(h) => {
+            if (offset > 0) {
+                match (fs.seek(h, offset)) {
+                    Result.Err(_) => {
+                        close(h);
+                        return b"";
+                    },
+                    Result.Ok(_) => { },
+                }
+            }
+            var out: bytes = b"";
+            var go: bool = true;
+            while (go && out.len() < max) {
+                match (fs.read_bytes(h, max - out.len())) {
+                    Result.Err(_) => {
+                        go = false;
+                    },
+                    Result.Ok(chunk_opt) => {
+                        match (chunk_opt) {
+                            Option.None => {
+                                go = false;
+                            },
+                            Option.Some(chunk) => {
+                                if (chunk.len() == 0) {
+                                    go = false;
+                                } else {
+                                    out = out + chunk;
+                                }
+                            },
+                        }
+                    },
+                }
+            }
+            close(h);
+            out
+        },
+    }
+}
+
+@test
+fn probes_a_real_png_and_wav() {
+    let root: string = fs.make_temp_dir("raystream_probe").unwrap_or("");
+    // Un PNG de 2×1 con cabecera válida basta: sólo se lee el IHDR.
+    let png: bytes = bytes_of([0x89, 0x50, 0x4E, 0x47, 0xD, 0xA, 0x1A, 0xA])
+        + bytes_of([0, 0, 0, 13])
+        + b"IHDR"
+        + bytes_of([0, 0, 0, 2])
+        + bytes_of([0, 0, 0, 1]);
+    fs.write_file_bytes(root + "/a.png", png).unwrap_or(0);
+    var it: Item = library.new_item("a.png", Kind.Image, png.len(), 0);
+    probe(root + "/a.png", it);
+    assert_eq(it.width, 2);
+    assert_eq(it.height, 1);
+
+    var wav_head: bytes = b"RIFF" + bytes_of([0, 0, 0, 0]) + b"WAVE" + b"fmt ";
+    wav_head = wav_head + bytes_of([16, 0, 0, 0]) + bytes_of([1, 0]) + bytes_of([1, 0]);
+    wav_head = wav_head + bytes_of([0x44, 0xAC, 0, 0]) + bytes_of([0x88, 0x58, 0x1, 0]);
+    wav_head = wav_head + bytes_of([2, 0]) + bytes_of([16, 0]);
+    wav_head = wav_head + b"data" + bytes_of([0x88, 0x58, 0x1, 0]);
+    fs.write_file_bytes(root + "/a.wav", wav_head).unwrap_or(0);
+    var wit: Item = library.new_item("a.wav", Kind.Audio, wav_head.len(), 0);
+    probe(root + "/a.wav", wit);
+    assert_eq(wit.duration_ms, 1000);
+
+    fs.remove_all(root).unwrap_or(0);
+}
+
+@test
+fn read_window_respects_its_bounds() {
+    let root: string = fs.make_temp_dir("raystream_window").unwrap_or("");
+    fs.write_file(root + "/x.bin", "0123456789").unwrap_or(0);
+    assert_eq(read_window(root + "/x.bin", 0, 4), b"0123");
+    assert_eq(read_window(root + "/x.bin", 6, 100), b"6789");
+    assert_eq(read_window(root + "/missing", 0, 10), b"");
+    fs.remove_all(root).unwrap_or(0);
+}

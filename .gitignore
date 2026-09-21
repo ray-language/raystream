@@ -1,0 +1,10 @@
+# dependencies downloaded by the package manager (M39c)
+.ray-deps/
+
+# the media library: user content, generated samples and the thumbnail cache
+media/
+
+# native binaries and profiler output
+raystream
+*.json.prof
+*.log

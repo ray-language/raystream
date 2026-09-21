@@ -1,0 +1,159 @@
+// Contenido de muestra para que la aplicación arranque en frío: si el directorio de la
+// biblioteca está vacío, se generan imágenes PNG y audio WAV reales (nada de ficheros
+// falsos: el reproductor del navegador los reproduce y el navegador los muestra).
+import std/fs;
+import std/image;
+import std/math;
+
+/// Fills `root` with a handful of playable/viewable files. Does nothing when the
+/// directory already has content. Returns how many files were written.
+pub fn populate(root: string) -> Result<int, string> {
+    let existing: [string] = fs.list_dir(root)?;
+    if (existing.len() > 0) {
+        return Result.Ok(0);
+    }
+    fs.mkdir(root + "/images")?;
+    fs.mkdir(root + "/audio")?;
+
+    var written: int = 0;
+    written = written + write_png(root + "/images/gradient.png", 640, 360, 0)?;
+    written = written + write_png(root + "/images/rings.png", 480, 480, 1)?;
+    written = written + write_png(root + "/images/checker.png", 512, 288, 2)?;
+    written = written + write_wav(root + "/audio/tone-a440.wav", 440.0, 3000)?;
+    written = written + write_wav(root + "/audio/tone-c523.wav", 523.25, 5000)?;
+    Result.Ok(written)
+}
+
+// Genera una imagen RGBA de 8 bits con uno de tres patrones y la guarda como PNG.
+fn write_png(path: string, w: int, h: int, pattern: int) -> Result<int, string> {
+    var px: [int] = [];
+    var y: int = 0;
+    while (y < h) {
+        var x: int = 0;
+        while (x < w) {
+            let rgb: [int] = pixel(pattern, x, y, w, h);
+            px.push(rgb[0]);
+            px.push(rgb[1]);
+            px.push(rgb[2]);
+            px.push(255);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    let img: image.Image = image.Image { width: w, height: h, pixels: bytes_of(px) };
+    let png: bytes = image.encode_png(img)?;
+    fs.write_file_bytes(path, png)?;
+    Result.Ok(1)
+}
+
+fn pixel(pattern: int, x: int, y: int, w: int, h: int) -> [int] {
+    if (pattern == 0) {
+        // Degradado diagonal.
+        [x * 255 / w, y * 255 / h, 160]
+    } else if (pattern == 1) {
+        // Anillos concéntricos.
+        let dx: float = int_to_float(x - w / 2);
+        let dy: float = int_to_float(y - h / 2);
+        let d: float = math.sqrt(dx * dx + dy * dy);
+        let band: int = float_to_int(d / 16.0) % 2;
+        if (band == 0) { [240, 80, 60] } else { [30, 30, 40] }
+    } else {
+        // Tablero de ajedrez.
+        let cell: int = ((x / 32) + (y / 32)) % 2;
+        if (cell == 0) { [250, 250, 250] } else { [70, 90, 220] }
+    }
+}
+
+// Un WAV PCM 16 bits mono a 44100 Hz con un tono senoidal y desvanecido al final, para
+// que el <audio> del navegador tenga algo real que reproducir y que se pueda buscar.
+fn write_wav(path: string, freq: float, millis: int) -> Result<int, string> {
+    let rate: int = 44100;
+    let frames: int = rate * millis / 1000;
+    var samples: [int] = [];
+    var i: int = 0;
+    while (i < frames) {
+        let t: float = int_to_float(i) / int_to_float(rate);
+        let fade: float = 1.0 - int_to_float(i) / int_to_float(frames);
+        let v: float = math.sin(2.0 * 3.14159265 * freq * t) * 12000.0 * fade;
+        let s: int = float_to_int(v);
+        let u: int = if (s < 0) { s + 65536 } else { s };
+        samples.push(u % 256);
+        samples.push((u / 256) % 256);
+        i = i + 1;
+    }
+    let data: bytes = bytes_of(samples);
+    let body_len: int = data.len();
+    var head: [int] = [];
+    append_ascii(head, "RIFF");
+    append_u32(head, 36 + body_len);
+    append_ascii(head, "WAVE");
+    append_ascii(head, "fmt ");
+    append_u32(head, 16);
+    append_u16(head, 1);
+    append_u16(head, 1);
+    append_u32(head, rate);
+    append_u32(head, rate * 2);
+    append_u16(head, 2);
+    append_u16(head, 16);
+    append_ascii(head, "data");
+    append_u32(head, body_len);
+    fs.write_file_bytes(path, bytes_of(head) + data)?;
+    Result.Ok(1)
+}
+
+fn append_ascii(out: [int], s: string) {
+    let bs: bytes = s.to_bytes();
+    var i: int = 0;
+    while (i < bs.len()) {
+        out.push(bs[i]);
+        i = i + 1;
+    }
+}
+
+fn append_u16(out: [int], v: int) {
+    out.push(v % 256);
+    out.push((v / 256) % 256);
+}
+
+fn append_u32(out: [int], v: int) {
+    out.push(v % 256);
+    out.push((v / 256) % 256);
+    out.push((v / 65536) % 256);
+    out.push((v / 16777216) % 256);
+}
+
+fn int_to_float(n: int) -> float {
+    n as float
+}
+
+fn float_to_int(f: float) -> int {
+    f as int
+}
+
+@test
+fn samples_are_real_files() {
+    let root: string = fs.make_temp_dir("raystream_samples").unwrap_or("");
+    assert(root != "");
+    let n: int = populate(root).unwrap_or(0);
+    assert(n >= 5);
+
+    // El PNG generado se vuelve a decodificar: es un PNG de verdad.
+    let png: bytes = fs.read_file_bytes(root + "/images/gradient.png").unwrap_or(b"");
+    match (image.decode_png(png)) {
+        Result.Ok(img) => {
+            assert_eq(img.width, 640);
+            assert_eq(img.height, 360);
+        },
+        Result.Err(e) => panic("generated png does not decode: ${e}"),
+    }
+
+    // La cabecera del WAV es la que dice ser y el tamaño cuadra.
+    let wav: bytes = fs.read_file_bytes(root + "/audio/tone-a440.wav").unwrap_or(b"");
+    assert(wav.starts_with(b"RIFF"));
+    assert_eq(wav.sub_bytes(8, 12), b"WAVE");
+    assert_eq(wav.len(), 44 + 44100 * 3000 / 1000 * 2);
+
+    // Segunda llamada: no toca nada.
+    assert_eq(populate(root).unwrap_or(0 - 1), 0);
+    fs.remove_all(root).unwrap_or(0);
+}

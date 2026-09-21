@@ -1,0 +1,64 @@
+// La API JSON: convierte preguntas del catálogo en cuerpos de respuesta.
+import std/json;
+import catalog/library;
+import catalog/store;
+from catalog/library import Item;
+from catalog/store import Store;
+
+/// `GET /api/library?kind=&q=` — the filtered library as a JSON array.
+pub fn library_json(st: Store, kind: string, query: string) -> string {
+    library.items_json(store.list(st, kind, query))
+}
+
+/// `GET /api/item/:id` — one item, or `None` when the id is unknown.
+pub fn item_json(st: Store, id: string) -> Option<string> {
+    match (store.find_by_id(st, id)) {
+        Option.Some(it) => Option.Some(library.item_json(it)),
+        Option.None => Option.None,
+    }
+}
+
+/// `GET /api/stats` — counts and total size, what the UI header shows.
+pub fn stats_json(st: Store, root: string) -> string {
+    let s: [int] = store.stats(st);
+    json
+        .obj()
+        .field("root", root)
+        .field("items", s[0])
+        .field("videos", s[1])
+        .field("audios", s[2])
+        .field("images", s[3])
+        .field("bytes", s[4])
+        .render()
+}
+
+/// A JSON error body.
+pub fn error_json(message: string) -> string {
+    json.obj().field("error", message).render()
+}
+
+@test
+fn stats_shape() {
+    let a: Item = library.new_item("a.mp4", library.Kind.Video, 5, 1);
+    let st: Store = store.start([a]);
+    let s: string = stats_json(st, "/tmp/x");
+    assert(s.contains("\"items\": 1"));
+    assert(s.contains("\"videos\": 1"));
+    assert(s.contains("\"bytes\": 5"));
+    store.stop(st);
+}
+
+@test
+fn item_json_is_optional() {
+    let a: Item = library.new_item("a.mp4", library.Kind.Video, 5, 1);
+    let st: Store = store.start([a]);
+    match (item_json(st, a.id)) {
+        Option.Some(s) => assert(s.contains("a.mp4")),
+        Option.None => panic("known id must resolve"),
+    }
+    match (item_json(st, "zzz")) {
+        Option.Some(_) => panic("unknown id must not resolve"),
+        Option.None => { },
+    }
+    store.stop(st);
+}

@@ -1,0 +1,362 @@
+// Salas sincronizadas: varios navegadores viendo o escuchando lo mismo, a la vez.
+//
+// Un actor por servidor guarda el estado de cada sala; cada conexión WebSocket usa dos
+// fibras, una que lee del socket y otra que escribe lo que difunde la sala, coordinadas
+// con `select` sobre dos canales. El socket lo lee UNA sola fibra: los frames no se
+// mezclan.
+import std/json;
+import std/net;
+import std/time;
+import net/webserver;
+import net/websocket;
+
+// Lo que un cliente puede pedir y lo que la sala responde: un JSON con `type`.
+enum RoomMsg {
+    Join(Member),
+    Leave(int),
+    Update(Change),
+    Snapshot(Ask),
+}
+
+struct Member {
+    room: string,
+    ch: Channel<string>,
+    reply: Channel<int>,
+}
+
+struct Change {
+    room: string,
+    from_id: int,
+    action: string,
+    item_id: string,
+    position_ms: int,
+}
+
+struct Ask {
+    room: string,
+    reply: Channel<string>,
+}
+
+/// A handle to the rooms actor.
+pub struct Rooms {
+    inbox: Channel<RoomMsg>,
+}
+
+// El estado de una sala: qué se reproduce, dónde y desde cuándo.
+struct RoomState {
+    name: string,
+    item_id: string,
+    position_ms: int,
+    playing: bool,
+    updated_at: int,
+}
+
+/// Starts the rooms actor.
+pub fn start() -> Rooms {
+    let inbox: Channel<RoomMsg> = Channel.new();
+    spawn(fn() {
+        run(inbox);
+    });
+    Rooms { inbox: inbox }
+}
+
+fn run(inbox: Channel<RoomMsg>) {
+    var states: [RoomState] = [];
+    var member_ids: [int] = [];
+    var member_rooms: [string] = [];
+    var member_chans: [Channel<string>] = [];
+    var next_id: int = 1;
+    var go: bool = true;
+    while (go) {
+        match (recv(inbox)) {
+            Option.None => {
+                go = false;
+            },
+            Option.Some(msg) => {
+                match (msg) {
+                    RoomMsg.Join(m) => {
+                        member_ids.push(next_id);
+                        member_rooms.push(m.room);
+                        member_chans.push(m.ch);
+                        send(m.reply, next_id);
+                        next_id = next_id + 1;
+                        let st: RoomState = ensure_room(states, m.room);
+                        send(m.ch, state_json(st, "state"));
+                    },
+                    RoomMsg.Leave(id) => {
+                        var ids: [int] = [];
+                        var rooms: [string] = [];
+                        var chans: [Channel<string>] = [];
+                        var i: int = 0;
+                        while (i < member_ids.len()) {
+                            if (member_ids[i] != id) {
+                                ids.push(member_ids[i]);
+                                rooms.push(member_rooms[i]);
+                                chans.push(member_chans[i]);
+                            }
+                            i = i + 1;
+                        }
+                        member_ids = ids;
+                        member_rooms = rooms;
+                        member_chans = chans;
+                    },
+                    RoomMsg.Snapshot(ask) => {
+                        send(ask.reply, state_json(ensure_room(states, ask.room), "state"));
+                    },
+                    RoomMsg.Update(ch) => {
+                        let st: RoomState = ensure_room(states, ch.room);
+                        apply(st, ch);
+                        let payload: string = state_json(st, "state");
+                        var i: int = 0;
+                        while (i < member_ids.len()) {
+                            if (member_rooms[i] == ch.room) {
+                                send(member_chans[i], payload);
+                            }
+                            i = i + 1;
+                        }
+                    },
+                }
+            },
+        }
+    }
+}
+
+// Devuelve la sala (creándola la primera vez). Los structs son referencias: mutar la
+// devuelta muta la que está en la lista.
+fn ensure_room(states: [RoomState], name: string) -> RoomState {
+    var i: int = 0;
+    while (i < states.len()) {
+        if (states[i].name == name) {
+            return states[i];
+        }
+        i = i + 1;
+    }
+    let fresh: RoomState = RoomState {
+        name: name,
+        item_id: "",
+        position_ms: 0,
+        playing: false,
+        updated_at: time.now()
+    };
+    states.push(fresh);
+    fresh
+}
+
+fn apply(st: RoomState, ch: Change) {
+    if (ch.action == "load") {
+        st.item_id = ch.item_id;
+        st.position_ms = 0;
+        st.playing = false;
+    } else if (ch.action == "play") {
+        st.playing = true;
+        st.position_ms = ch.position_ms;
+    } else if (ch.action == "pause") {
+        st.playing = false;
+        st.position_ms = ch.position_ms;
+    } else if (ch.action == "seek") {
+        st.position_ms = ch.position_ms;
+    }
+    st.updated_at = time.now();
+}
+
+fn state_json(st: RoomState, kind: string) -> string {
+    json
+        .obj()
+        .field("type", kind)
+        .field("room", st.name)
+        .field("item_id", st.item_id)
+        .field("position_ms", st.position_ms)
+        .field("playing", st.playing)
+        .field("updated_at", st.updated_at)
+        .render()
+}
+
+/// Handles `GET /ws/room/:name`: performs the upgrade and joins the room. Blocks the
+/// connection fiber until the socket dies.
+pub fn serve_room(rooms: Rooms, room: string, req: webserver.Request, conn: int) {
+    let key: string = match (get(req.headers, "sec-websocket-key")) {
+        Option.Some(v) => v,
+        Option.None => "",
+    };
+    if (key == "") {
+        let r: webserver.Response = webserver.text(400, "not a websocket handshake\n");
+        webserver.send_response(conn, r).unwrap_or(0);
+        return;
+    }
+    match (net.socket_write(conn, websocket.handshake_response(key))) {
+        Result.Err(_) => {
+            return;
+        },
+        Result.Ok(_) => { },
+    }
+
+    // Alta en la sala.
+    let from_room: Channel<string> = Channel.new();
+    let reply: Channel<int> = Channel.new();
+    send(rooms.inbox, RoomMsg.Join(Member { room: room, ch: from_room, reply: reply }));
+    let id: int = recv(reply).unwrap_or(0);
+
+    // Una fibra lee el socket y vuelca los mensajes en un canal; así la fibra principal
+    // puede esperar con `select` al socket Y a la sala a la vez.
+    let from_socket: Channel<string> = Channel.new();
+    spawn(fn() {
+        reader(conn, from_socket);
+    });
+
+    var go: bool = true;
+    while (go) {
+        let ready: int = select([from_socket, from_room]);
+        if (ready == 0) {
+            match (recv(from_socket)) {
+                Option.None => {
+                    go = false;
+                },
+                Option.Some(text) => {
+                    handle_client_message(rooms, room, id, text);
+                },
+            }
+        } else {
+            match (recv(from_room)) {
+                Option.None => {
+                    go = false;
+                },
+                Option.Some(payload) => {
+                    match (net.socket_write_bytes(conn, websocket.encode_text(payload))) {
+                        Result.Err(_) => {
+                            go = false;
+                        },
+                        Result.Ok(_) => { },
+                    }
+                },
+            }
+        }
+    }
+    send(rooms.inbox, RoomMsg.Leave(id));
+    // El cierre del socket lo hace quien aceptó la conexión (src/main.ray).
+}
+
+// La fibra lectora: cada mensaje de texto del cliente va al canal; un cierre lo cierra.
+fn reader(conn: int, out: Channel<string>) {
+    let ws: websocket.WsConn = websocket.server_conn(conn);
+    var go: bool = true;
+    while (go) {
+        match (websocket.read_message(ws)) {
+            Result.Err(_) => {
+                go = false;
+            },
+            Result.Ok(frame) => {
+                if (frame.opcode == websocket.op_close()) {
+                    go = false;
+                } else if (frame.opcode == websocket.op_text()) {
+                    match (from_utf8(frame.payload)) {
+                        Result.Ok(text) => {
+                            send(out, text);
+                        },
+                        Result.Err(_) => { },
+                    }
+                }
+            },
+        }
+    }
+    close(out);
+}
+
+fn handle_client_message(rooms: Rooms, room: string, id: int, text: string) {
+    match (json.parse(text)) {
+        Result.Err(_) => { },
+        Result.Ok(j) => {
+            let action: string = json.get_string(j, "type").unwrap_or("");
+            if (action == "") {
+                return;
+            }
+            let item_id: string = json.get_string(j, "item_id").unwrap_or("");
+            let position: int = json.get_int(j, "position_ms").unwrap_or(0);
+            send(
+                rooms.inbox,
+                RoomMsg.Update(
+                    Change {
+                        room: room,
+                        from_id: id,
+                        action: action,
+                        item_id: item_id,
+                        position_ms: position
+                    }
+                )
+            );
+        },
+    }
+}
+
+@test
+fn a_room_broadcasts_state_to_its_members() {
+    let rooms: Rooms = start();
+    let a: Channel<string> = Channel.new();
+    let b: Channel<string> = Channel.new();
+    let other: Channel<string> = Channel.new();
+    let ra: Channel<int> = Channel.new();
+    let rb: Channel<int> = Channel.new();
+    let ro: Channel<int> = Channel.new();
+    send(rooms.inbox, RoomMsg.Join(Member { room: "salon", ch: a, reply: ra }));
+    send(rooms.inbox, RoomMsg.Join(Member { room: "salon", ch: b, reply: rb }));
+    send(rooms.inbox, RoomMsg.Join(Member { room: "cocina", ch: other, reply: ro }));
+    let id_a: int = recv(ra).unwrap_or(0);
+    let _b: int = recv(rb).unwrap_or(0);
+    let _o: int = recv(ro).unwrap_or(0);
+
+    // Al entrar, cada uno recibe el estado inicial de SU sala.
+    assert(recv(a).unwrap_or("").contains("\"room\": \"salon\""));
+    assert(recv(b).unwrap_or("").contains("\"room\": \"salon\""));
+    assert(recv(other).unwrap_or("").contains("\"room\": \"cocina\""));
+
+    send(
+        rooms.inbox,
+        RoomMsg.Update(
+            Change { room: "salon", from_id: id_a, action: "load", item_id: "abc", position_ms: 0 }
+        )
+    );
+    send(
+        rooms.inbox,
+        RoomMsg.Update(
+            Change { room: "salon", from_id: id_a, action: "play", item_id: "", position_ms: 4200 }
+        )
+    );
+
+    assert(recv(a).unwrap_or("").contains("\"item_id\": \"abc\""));
+    let played: string = recv(a).unwrap_or("");
+    assert(played.contains("\"playing\": true"));
+    assert(played.contains("\"position_ms\": 4200"));
+    // El otro miembro de la sala ve lo mismo…
+    assert(recv(b).unwrap_or("").contains("\"item_id\": \"abc\""));
+    // …y la sala de al lado no se entera.
+    match (try_recv(other)) {
+        Received.Got(v) => panic("another room got ${v}"),
+        Received.Empty => { },
+        Received.Closed => { },
+    }
+}
+
+@test
+fn leaving_stops_the_updates() {
+    let rooms: Rooms = start();
+    let a: Channel<string> = Channel.new();
+    let ra: Channel<int> = Channel.new();
+    send(rooms.inbox, RoomMsg.Join(Member { room: "r", ch: a, reply: ra }));
+    let id: int = recv(ra).unwrap_or(0);
+    let _initial: string = recv(a).unwrap_or("");
+    send(rooms.inbox, RoomMsg.Leave(id));
+    send(
+        rooms.inbox,
+        RoomMsg.Update(
+            Change { room: "r", from_id: 0, action: "play", item_id: "", position_ms: 1 }
+        )
+    );
+    // Una consulta posterior confirma que el actor sigue vivo y con el estado aplicado.
+    let ask: Channel<string> = Channel.new();
+    send(rooms.inbox, RoomMsg.Snapshot(Ask { room: "r", reply: ask }));
+    assert(recv(ask).unwrap_or("").contains("\"playing\": true"));
+    match (try_recv(a)) {
+        Received.Got(v) => panic("a member who left got ${v}"),
+        Received.Empty => { },
+        Received.Closed => { },
+    }
+}

@@ -1,0 +1,9 @@
+[package]
+name = "raystream"
+version = "0.1.0"
+
+[dependencies]
+net = "^0.3.0"
+
+[native]
+embed = ["assets"]

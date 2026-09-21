@@ -1,0 +1,294 @@
+// El modelo del catálogo: qué es un item, cómo se identifica y cómo se serializa.
+// Sin E/S: este módulo es puro para que los tests no toquen el disco.
+import std/crypto;
+import std/hex;
+import std/json;
+
+/// What kind of media an item is. The extension decides; there is no sniffing.
+@derive(Eq, Show)
+pub enum Kind {
+    Video,
+    Audio,
+    Image,
+}
+
+/// A subtitle sidecar found next to a media file. `rel` is relative to the library root
+/// and `lang` is the code guessed from the file name (`movie.es.srt` → `es`).
+@derive(Show)
+pub struct Track {
+    rel: string,
+    lang: string,
+    label: string,
+    format: string,
+}
+
+/// One entry of the library. `rel` is the path relative to the library root and is the
+/// only thing the `id` is derived from, so ids survive restarts and re-indexing.
+@derive(Show)
+pub struct Item {
+    id: string,
+    rel: string,
+    name: string,
+    kind: Kind,
+    mime: string,
+    size: int,
+    mtime_ms: int,
+    // Metadatos que rellenan los parsers de `src/meta` (0 / "" = desconocido).
+    duration_ms: int,
+    width: int,
+    height: int,
+    title: string,
+    artist: string,
+    album: string,
+    has_cover: bool,
+    tracks: [Track],
+}
+
+/// The kind's wire name, used by the JSON API and the UI.
+pub fn kind_name(k: Kind) -> string {
+    match (k) {
+        Kind.Video => "video",
+        Kind.Audio => "audio",
+        Kind.Image => "image",
+    }
+}
+
+/// The lowercase extension of a path, without the dot (`""` when there is none).
+pub fn extension_of(path: string) -> string {
+    let dot: int = last_index_of(path, '.');
+    if (dot < 0) {
+        return "";
+    }
+    let slash: int = last_index_of(path, '/');
+    if (dot < slash) {
+        return "";
+    }
+    path.substring(dot + 1, path.len()).to_lower()
+}
+
+/// The file name of a path (everything after the last `/`).
+pub fn base_name(path: string) -> string {
+    let slash: int = last_index_of(path, '/');
+    if (slash < 0) {
+        return path;
+    }
+    path.substring(slash + 1, path.len())
+}
+
+// La última posición de un carácter, o -1. (No hay `rindex` en la stdlib.)
+fn last_index_of(s: string, c: char) -> int {
+    var i: int = s.len() - 1;
+    while (i >= 0) {
+        if (s[i] == c) {
+            return i;
+        }
+        i = i - 1;
+    }
+    0 - 1
+}
+
+/// The kind an extension maps to, or `None` when the file is not media we serve.
+pub fn kind_of_extension(ext: string) -> Option<Kind> {
+    if (ext == "mp4" || ext == "m4v" || ext == "mov" || ext == "webm" || ext == "mkv") {
+        Option.Some(Kind.Video)
+    } else if (ext == "mp3"
+        || ext == "m4a"
+        || ext == "aac"
+        || ext == "wav"
+        || ext == "flac"
+        || ext == "ogg"
+        || ext == "opus") {
+        Option.Some(Kind.Audio)
+    } else if (ext == "png"
+        || ext == "jpg"
+        || ext == "jpeg"
+        || ext == "gif"
+        || ext == "webp"
+        || ext == "avif"
+        || ext == "bmp") {
+        Option.Some(Kind.Image)
+    } else {
+        Option.None
+    }
+}
+
+/// The MIME type an extension maps to (`application/octet-stream` when unknown).
+pub fn mime_of_extension(ext: string) -> string {
+    if (ext == "mp4" || ext == "m4v") {
+        "video/mp4"
+    } else if (ext == "mov") {
+        "video/quicktime"
+    } else if (ext == "webm") {
+        "video/webm"
+    } else if (ext == "mkv") {
+        "video/x-matroska"
+    } else if (ext == "mp3") {
+        "audio/mpeg"
+    } else if (ext == "m4a" || ext == "aac") {
+        "audio/mp4"
+    } else if (ext == "wav") {
+        "audio/wav"
+    } else if (ext == "flac") {
+        "audio/flac"
+    } else if (ext == "ogg") {
+        "audio/ogg"
+    } else if (ext == "opus") {
+        "audio/opus"
+    } else if (ext == "png") {
+        "image/png"
+    } else if (ext == "jpg" || ext == "jpeg") {
+        "image/jpeg"
+    } else if (ext == "gif") {
+        "image/gif"
+    } else if (ext == "webp") {
+        "image/webp"
+    } else if (ext == "avif") {
+        "image/avif"
+    } else if (ext == "bmp") {
+        "image/bmp"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+/// The stable id of a relative path: the first 12 hex characters of its SHA-256.
+/// Same path, same id, across runs and machines — the UI can bookmark it.
+pub fn id_of(rel: string) -> string {
+    let digest: bytes = crypto.sha256(rel.to_bytes());
+    hex.hex_encode(digest).substring(0, 12)
+}
+
+/// Builds an item from what the filesystem already told us. Metadata parsers fill the
+/// rest in a second pass.
+pub fn new_item(rel: string, kind: Kind, size: int, mtime_ms: int) -> Item {
+    let ext: string = extension_of(rel);
+    Item {
+        id: id_of(rel),
+        rel: rel,
+        name: base_name(rel),
+        kind: kind,
+        mime: mime_of_extension(ext),
+        size: size,
+        mtime_ms: mtime_ms,
+        duration_ms: 0,
+        width: 0,
+        height: 0,
+        title: "",
+        artist: "",
+        album: "",
+        has_cover: false,
+        tracks: []
+    }
+}
+
+/// The JSON of one item, as the API serves it.
+pub fn item_json(it: Item) -> string {
+    json
+        .obj()
+        .field("id", it.id)
+        .field("name", it.name)
+        .field("rel", it.rel)
+        .field("kind", kind_name(it.kind))
+        .field("mime", it.mime)
+        .field("size", it.size)
+        .field("mtime_ms", it.mtime_ms)
+        .field("duration_ms", it.duration_ms)
+        .field("width", it.width)
+        .field("height", it.height)
+        .field("title", it.title)
+        .field("artist", it.artist)
+        .field("album", it.album)
+        .field("has_cover", it.has_cover)
+        .field("subtitles", json.list(track_objects(it)))
+        .render()
+}
+
+// Las pistas de subtítulos de un item como objetos JSON, con la URL por la que se sirven.
+fn track_objects(it: Item) -> [json.Obj] {
+    var out: [json.Obj] = [];
+    var i: int = 0;
+    while (i < it.tracks.len()) {
+        let t: Track = it.tracks[i];
+        out.push(json
+            .obj()
+            .field("lang", t.lang)
+            .field("label", t.label)
+            .field("url", "/subs/${it.id}/${i}"));
+        i = i + 1;
+    }
+    out
+}
+
+/// The JSON array of a list of items.
+pub fn items_json(items: [Item]) -> string {
+    var out: string = "[";
+    var i: int = 0;
+    while (i < items.len()) {
+        if (i > 0) {
+            out = out + ",";
+        }
+        out = out + item_json(items[i]);
+        i = i + 1;
+    }
+    out + "]"
+}
+
+/// Whether an item matches a free-text query (name, title, artist and album).
+pub fn matches(it: Item, needle: string) -> bool {
+    if (needle == "") {
+        return true;
+    }
+    let q: string = needle.to_lower();
+    it.name.to_lower().contains(q)
+        || it.title.to_lower().contains(q)
+        || it.artist.to_lower().contains(q)
+        || it.album.to_lower().contains(q)
+}
+
+@test
+fn ids_are_stable_and_short() {
+    assert_eq(id_of("a/b.mp4").len(), 12);
+    assert_eq(id_of("a/b.mp4"), id_of("a/b.mp4"));
+    assert(id_of("a/b.mp4") != id_of("a/c.mp4"));
+}
+
+@test
+fn extensions_and_names() {
+    assert_eq(extension_of("x/y/Movie.MP4"), "mp4");
+    assert_eq(extension_of("x/y/noext"), "");
+    assert_eq(extension_of("x.y/noext"), "");
+    assert_eq(base_name("x/y/Movie.mp4"), "Movie.mp4");
+    assert_eq(base_name("Movie.mp4"), "Movie.mp4");
+}
+
+@test
+fn kinds_and_mimes() {
+    match (kind_of_extension("mp4")) {
+        Option.Some(k) => assert_eq(kind_name(k), "video"),
+        Option.None => panic("mp4 should be video"),
+    }
+    match (kind_of_extension("txt")) {
+        Option.Some(_) => panic("txt is not media"),
+        Option.None => { },
+    }
+    assert_eq(mime_of_extension("mp3"), "audio/mpeg");
+    assert_eq(mime_of_extension("zzz"), "application/octet-stream");
+}
+
+@test
+fn item_json_has_the_api_shape() {
+    let it: Item = new_item("music/song.mp3", Kind.Audio, 1234, 99);
+    let s: string = item_json(it);
+    assert(s.contains("\"kind\": \"audio\""));
+    assert(s.contains("\"size\": 1234"));
+    assert(s.contains("\"name\": \"song.mp3\""));
+}
+
+@test
+fn search_matches_metadata() {
+    var it: Item = new_item("music/song.mp3", Kind.Audio, 1, 1);
+    it.artist = "Miles Davis";
+    assert(matches(it, "miles"));
+    assert(matches(it, ""));
+    assert(!matches(it, "coltrane"));
+}

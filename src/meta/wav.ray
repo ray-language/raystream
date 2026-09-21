@@ -1,0 +1,95 @@
+// WAV (RIFF): duración exacta a partir de la cabecera `fmt ` y el tamaño del chunk `data`.
+// No hace falta leer el fichero entero: con los primeros kilobytes basta.
+import meta/binary;
+
+/// What a WAV header tells us. `duration_ms` is 0 when the file is not a usable WAV.
+pub struct WavInfo {
+    channels: int,
+    sample_rate: int,
+    bits: int,
+    duration_ms: int,
+}
+
+/// Parses the RIFF chunk list. `head` only needs to cover the header chunks, not the
+/// audio: everything needed lives in the first few hundred octets.
+pub fn parse(head: bytes) -> Option<WavInfo> {
+    if (head.len() < 12 || !head.starts_with(b"RIFF") || binary.tag4(head, 8) != "WAVE") {
+        return Option.None;
+    }
+    var channels: int = 0;
+    var rate: int = 0;
+    var bits: int = 0;
+    var data_len: int = 0;
+    var pos: int = 12;
+    while (pos + 8 <= head.len()) {
+        let id: string = binary.tag4(head, pos);
+        let size: int = binary.le_u32(head, pos + 4);
+        let body: int = pos + 8;
+        if (id == "fmt " && body + 16 <= head.len()) {
+            channels = binary.le_u16(head, body + 2);
+            rate = binary.le_u32(head, body + 4);
+            bits = binary.le_u16(head, body + 14);
+        } else if (id == "data") {
+            data_len = size;
+            // El chunk de datos es el último que nos interesa.
+            pos = head.len();
+            continue;
+        }
+        if (size <= 0) {
+            // Un tamaño inválido evita el bucle infinito.
+            pos = head.len();
+            continue;
+        }
+        // Los chunks RIFF se alinean a par.
+        pos = body + size + (size % 2);
+    }
+    if (rate <= 0 || channels <= 0 || bits <= 0) {
+        return Option.None;
+    }
+    let bytes_per_second: int = rate * channels * bits / 8;
+    let duration: int = if (bytes_per_second > 0 && data_len > 0) {
+        data_len * 1000 / bytes_per_second
+    } else {
+        0
+    };
+    Option.Some(
+        WavInfo { channels: channels, sample_rate: rate, bits: bits, duration_ms: duration }
+    )
+}
+
+@test
+fn reads_a_synthetic_header() {
+    // 44 100 Hz, mono, 16 bits, 88 200 octetos de datos → 1 000 ms exactos.
+    var b: bytes = b"RIFF";
+    b = b + bytes_of([0, 0, 0, 0]) + b"WAVE" + b"fmt ";
+    b = b + bytes_of([16, 0, 0, 0]);  // tamaño del fmt
+    b = b + bytes_of([1, 0]);  // PCM
+    b = b + bytes_of([1, 0]);  // canales
+    b = b + bytes_of([0x44, 0xAC, 0, 0]);  // 44100
+    b = b + bytes_of([0x88, 0x58, 0x1, 0]);  // byte rate
+    b = b + bytes_of([2, 0]);  // block align
+    b = b + bytes_of([16, 0]);  // bits
+    b = b + b"data" + bytes_of([0x88, 0x58, 0x1, 0]);  // 88200
+
+    match (parse(b)) {
+        Option.Some(info) => {
+            assert_eq(info.sample_rate, 44100);
+            assert_eq(info.channels, 1);
+            assert_eq(info.bits, 16);
+            assert_eq(info.duration_ms, 1000);
+        },
+        Option.None => panic("should parse"),
+    }
+}
+
+@test
+fn rejects_non_wav() {
+    match (parse(b"not a wav file at all")) {
+        Option.Some(_) => panic("should not parse"),
+        Option.None => { },
+    }
+    match (parse(b"RIFF")) {
+        Option.Some(_) => panic("should not parse"),
+        Option.None => { },
+    }
+}

@@ -1,0 +1,251 @@
+// La biblioteca viva: un vigilante del directorio (eventos del kernel, no polling) que
+// reindexa y un hub que empuja el cambio a los navegadores por Server-Sent Events.
+//
+// Tres fibras en juego: la del vigilante, la del hub (dueña de la lista de suscriptores)
+// y una por conexión SSE. Todas hablan por canales: ningún estado compartido.
+import std/fs;
+import std/json;
+import std/time;
+import catalog/indexer;
+import catalog/store;
+import net/webserver;
+from catalog/library import Item;
+from catalog/store import Store;
+
+// Alta de un suscriptor: su canal de eventos y por dónde devolverle su identificador.
+// (No se llama `Sub`: ese nombre choca con el trait del prelude — NOTES-raylang.md, 8.)
+struct Listener {
+    ch: Channel<string>,
+    reply: Channel<int>,
+}
+
+enum HubMsg {
+    Subscribe(Listener),
+    Unsubscribe(int),
+    Publish(string),
+}
+
+/// A handle to the event hub. Copyable; every call is a message.
+pub struct Hub {
+    inbox: Channel<HubMsg>,
+}
+
+/// Starts the hub fiber plus a heartbeat that keeps idle connections alive (and reaps
+/// the ones whose browser went away).
+pub fn start() -> Hub {
+    let inbox: Channel<HubMsg> = Channel.new();
+    spawn(fn() {
+        run(inbox);
+    });
+    spawn(fn() {
+        heartbeat(inbox);
+    });
+    Hub { inbox: inbox }
+}
+
+fn run(inbox: Channel<HubMsg>) {
+    var ids: [int] = [];
+    var chans: [Channel<string>] = [];
+    var next_id: int = 1;
+    var go: bool = true;
+    while (go) {
+        match (recv(inbox)) {
+            Option.None => {
+                go = false;
+            },
+            Option.Some(msg) => {
+                match (msg) {
+                    HubMsg.Subscribe(sub) => {
+                        ids.push(next_id);
+                        chans.push(sub.ch);
+                        send(sub.reply, next_id);
+                        next_id = next_id + 1;
+                    },
+                    HubMsg.Unsubscribe(id) => {
+                        var keep_ids: [int] = [];
+                        var keep_chans: [Channel<string>] = [];
+                        var i: int = 0;
+                        while (i < ids.len()) {
+                            if (ids[i] != id) {
+                                keep_ids.push(ids[i]);
+                                keep_chans.push(chans[i]);
+                            }
+                            i = i + 1;
+                        }
+                        ids = keep_ids;
+                        chans = keep_chans;
+                    },
+                    HubMsg.Publish(payload) => {
+                        var i: int = 0;
+                        while (i < chans.len()) {
+                            send(chans[i], payload);
+                            i = i + 1;
+                        }
+                    },
+                }
+            },
+        }
+    }
+}
+
+// Un latido cada 20 s: mantiene viva la conexión a través de proxies y hace que una
+// conexión muerta falle al escribir, que es como se descubre y se da de baja.
+fn heartbeat(inbox: Channel<HubMsg>) {
+    var go: bool = true;
+    while (go) {
+        time.sleep(20000);
+        send(inbox, HubMsg.Publish(json.obj().field("type", "ping").render()));
+    }
+}
+
+/// Broadcasts a JSON payload to every connected browser.
+pub fn publish(hub: Hub, payload: string) {
+    send(hub.inbox, HubMsg.Publish(payload));
+}
+
+/// Serves one `GET /events` connection: opens the SSE stream and forwards whatever the
+/// hub publishes until the browser goes away. Blocks the connection fiber, by design.
+pub fn serve_sse(hub: Hub, conn: int) {
+    let ch: Channel<string> = Channel.new();
+    let reply: Channel<int> = Channel.new();
+    send(hub.inbox, HubMsg.Subscribe(Listener { ch: ch, reply: reply }));
+    let id: int = match (recv(reply)) {
+        Option.Some(v) => v,
+        Option.None => 0,
+    };
+    match (webserver.sse_open(conn)) {
+        Result.Err(_) => {
+            send(hub.inbox, HubMsg.Unsubscribe(id));
+            return;
+        },
+        Result.Ok(_) => { },
+    }
+    // Primer evento: el cliente sabe que está conectado sin esperar a que cambie nada.
+    let hello: string = json.obj().field("type", "hello").render();
+    match (webserver.sse_event(conn, hello)) {
+        Result.Err(_) => {
+            send(hub.inbox, HubMsg.Unsubscribe(id));
+            return;
+        },
+        Result.Ok(_) => { },
+    }
+    var go: bool = true;
+    while (go) {
+        match (recv(ch)) {
+            Option.None => {
+                go = false;
+            },
+            Option.Some(payload) => {
+                match (webserver.sse_event(conn, payload)) {
+                    Result.Err(_) => {
+                        go = false;
+                    },
+                    Result.Ok(_) => { },
+                }
+            },
+        }
+    }
+    send(hub.inbox, HubMsg.Unsubscribe(id));
+}
+
+/// Starts the directory watcher: kernel events (FSEvents/inotify), coalesced, then a
+/// re-index and a `library_changed` broadcast. Returns immediately.
+pub fn watch_library(hub: Hub, st: Store, root: string) {
+    spawn(fn() {
+        watcher(hub, st, root);
+    });
+}
+
+fn watcher(hub: Hub, st: Store, root: string) {
+    match (fs.watch(root)) {
+        Result.Err(e) => {
+            eprint("watch ${root}: ${e} (live updates disabled)");
+        },
+        Result.Ok(h) => {
+            var go: bool = true;
+            while (go) {
+                match (fs.next_event(h)) {
+                    Result.Err(e) => {
+                        eprint("watch: ${e}");
+                        go = false;
+                    },
+                    Result.Ok(first) => {
+                        // Una copia de ficheros dispara decenas de eventos: se absorben
+                        // los que lleguen en la siguiente media ventana y se reindexa una vez.
+                        drain(h, 400);
+                        reindex(hub, st, root, first.path);
+                    },
+                }
+            }
+        },
+    }
+}
+
+// Consume los eventos que sigan llegando durante `ms` (coalescencia de ráfagas).
+fn drain(h: int, ms: int) {
+    var go: bool = true;
+    while (go) {
+        match (fs.next_event_timeout(h, ms)) {
+            Result.Err(_) => {
+                go = false;
+            },
+            Result.Ok(more) => {
+                match (more) {
+                    Option.None => {
+                        go = false;
+                    },
+                    Option.Some(_) => { },
+                }
+            },
+        }
+    }
+}
+
+fn reindex(hub: Hub, st: Store, root: string, path: string) {
+    // Los cambios dentro de la propia caché no son cambios de la biblioteca.
+    if (path.contains("/.raystream/")) {
+        return;
+    }
+    match (indexer.build(root)) {
+        Result.Err(e) => {
+            eprint("reindex: ${e}");
+        },
+        Result.Ok(items) => {
+            store.replace(st, items);
+            let payload: string = json
+                .obj()
+                .field("type", "library_changed")
+                .field("items", items.len())
+                .render();
+            publish(hub, payload);
+            print("library changed → ${items.len()} item(s)");
+        },
+    }
+}
+
+@test
+fn the_hub_fans_out_to_every_subscriber() {
+    let hub: Hub = start();
+    let a: Channel<string> = Channel.new();
+    let b: Channel<string> = Channel.new();
+    let ra: Channel<int> = Channel.new();
+    let rb: Channel<int> = Channel.new();
+    send(hub.inbox, HubMsg.Subscribe(Listener { ch: a, reply: ra }));
+    send(hub.inbox, HubMsg.Subscribe(Listener { ch: b, reply: rb }));
+    let id_a: int = recv(ra).unwrap_or(0);
+    let _id_b: int = recv(rb).unwrap_or(0);
+
+    publish(hub, "one");
+    assert_eq(recv(a).unwrap_or(""), "one");
+    assert_eq(recv(b).unwrap_or(""), "one");
+
+    // Tras darse de baja, el primero ya no recibe nada y el segundo sigue.
+    send(hub.inbox, HubMsg.Unsubscribe(id_a));
+    publish(hub, "two");
+    assert_eq(recv(b).unwrap_or(""), "two");
+    match (try_recv(a)) {
+        Received.Got(v) => panic("unsubscribed channel got ${v}"),
+        Received.Empty => { },
+        Received.Closed => { },
+    }
+}

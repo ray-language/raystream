@@ -1,0 +1,111 @@
+// Configuración del servidor: se construye desde los argumentos de línea de comandos.
+// Todo lo que el usuario puede tocar al arrancar vive aquí.
+import std/fs;
+
+/// The server configuration, built from the command line.
+pub struct Config {
+    dir: string,
+    host: string,
+    port: int,
+    scan_only: bool,
+}
+
+/// The default configuration: the `media` directory next to the project, on port 8080.
+pub fn defaults() -> Config {
+    Config { dir: "media", host: "127.0.0.1", port: 8080, scan_only: false }
+}
+
+/// The text printed by `--help`.
+pub fn usage() -> string {
+    `raystream — a personal media server written in raylang
+
+Usage: ray run -- [options]
+
+Options:
+  --dir PATH     media library directory (default: media)
+  --host HOST    address to bind (default: 127.0.0.1)
+  --port N       port to bind (default: 8080)
+  --scan-only    index the library, print a summary and exit
+  --help         this text
+`
+}
+
+/// Parses the command line into a `Config`. `Err` carries a message ready to print.
+pub fn parse(argv: [string]) -> Result<Config, string> {
+    var cfg: Config = defaults();
+    var i: int = 0;
+    while (i < argv.len()) {
+        let a: string = argv[i];
+        if (a == "--help" || a == "-h") {
+            return Result.Err(usage());
+        } else if (a == "--scan-only") {
+            cfg.scan_only = true;
+            i = i + 1;
+        } else if (a == "--dir" || a == "--host" || a == "--port") {
+            if (i + 1 >= argv.len()) {
+                return Result.Err("missing value for ${a}");
+            }
+            let v: string = argv[i + 1];
+            if (a == "--dir") {
+                cfg.dir = v;
+            } else if (a == "--host") {
+                cfg.host = v;
+            } else {
+                match (parse_int(v)) {
+                    Option.Some(n) => {
+                        cfg.port = n;
+                    },
+                    Option.None => {
+                        return Result.Err("--port: not a number: ${v}");
+                    },
+                }
+            }
+            i = i + 2;
+        } else {
+            return Result.Err("unknown option: ${a}");
+        }
+    }
+    Result.Ok(cfg)
+}
+
+/// Resolves the library directory to an absolute, symlink-free path, creating it if needed.
+/// Every later path check is done against this root.
+pub fn resolve_dir(cfg: Config) -> Result<string, string> {
+    if (!fs.exists(cfg.dir)) {
+        fs.mkdir(cfg.dir)?;
+    }
+    fs.real_path(cfg.dir)
+}
+
+@test
+fn parse_defaults() {
+    let empty: [string] = [];
+    match (parse(empty)) {
+        Result.Ok(c) => {
+            assert_eq(c.dir, "media");
+            assert_eq(c.port, 8080);
+            assert(!c.scan_only);
+        },
+        Result.Err(e) => panic("unexpected error: ${e}"),
+    }
+}
+
+@test
+fn parse_flags() {
+    match (parse(["--dir", "/tmp/m", "--port", "9000", "--scan-only"])) {
+        Result.Ok(c) => {
+            assert_eq(c.dir, "/tmp/m");
+            assert_eq(c.port, 9000);
+            assert(c.scan_only);
+        },
+        Result.Err(e) => panic("unexpected error: ${e}"),
+    }
+}
+
+@test
+fn parse_rejects_bad_port() {
+    match (parse(["--port", "abc"])) {
+        Result.Ok(_) => panic("should have failed"),
+        Result.Err(e) => assert(e.contains("not a number")),
+    }
+}

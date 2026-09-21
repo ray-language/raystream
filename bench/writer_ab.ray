@@ -1,0 +1,110 @@
+// A/B de los dos escritores de fichero, en el MISMO binario y la MISMA versión, para que
+// la única variable sea el escritor:
+//
+//   direct  — bucle propio: fs.open + read_bytes(256 KB) + net.socket_write_bytes, todo en
+//             la fibra de la conexión. Un trozo en vuelo.
+//   package — webserver.serve_file: un productor en su propia fibra manda los trozos por un
+//             canal acotado y el emisor los escribe. Dos trozos en vuelo (cola 1 + el que
+//             se escribe) y una copia por trozo al cruzar el canal.
+//
+// Uso:  writer_ab <direct|package> <fichero> [puerto]
+// El servidor sirve ese fichero entero en cualquier ruta; el banco mide desde fuera.
+import std/fs;
+import std/net;
+import net/webserver;
+
+const CHUNK: int = 262144;
+
+fn main() -> int {
+    let argv: [string] = args();
+    if (argv.len() < 2) {
+        print("usage: writer_ab <direct|package> <file> [port]");
+        return 2;
+    }
+    let mode: string = argv[0];
+    let file: string = argv[1];
+    let port: int = if (argv.len() > 2) { parse_int(argv[2]).unwrap_or(8099) } else { 8099 };
+    if (mode != "direct" && mode != "package") {
+        print("mode must be 'direct' or 'package'");
+        return 2;
+    }
+    let size: int = match (fs.stat(file)) {
+        Result.Ok(st) => st.size,
+        Result.Err(e) => {
+            eprint("stat ${file}: ${e}");
+            return 1;
+        },
+    };
+    print("writer_ab mode=${mode} file=${file} size=${size} port=${port}");
+    let limits: webserver.Limits = webserver.default_limits();
+    limits.max_conns = 128;
+    match (webserver.serve_raw_limits(
+        "127.0.0.1",
+        port,
+        limits,
+        fn(req: webserver.Request, conn: int) {
+            if (mode == "direct") {
+                serve_direct(conn, file, size);
+            } else {
+                match (webserver.send_response(conn, webserver.serve_file(file, req))) {
+                    Result.Ok(_) => { },
+                    Result.Err(_) => { },
+                }
+            }
+        }
+    )) {
+        Result.Ok(_) => 0,
+        Result.Err(e) => {
+            eprint(e);
+            1
+        },
+    }
+}
+
+// El escritor directo: cabeceras a mano y el cuerpo trozo a trozo, sin fibra intermedia.
+fn serve_direct(conn: int, file: string, size: int) {
+    var head: string = "HTTP/1.1 200 OK\r\n";
+    head = head + "Content-Length: ${size}\r\n";
+    head = head + "Content-Type: application/octet-stream\r\n";
+    head = head + "Accept-Ranges: bytes\r\n";
+    head = head + "Connection: close\r\n\r\n";
+    match (net.socket_write_bytes(conn, head.to_bytes())) {
+        Result.Err(_) => {
+            return;
+        },
+        Result.Ok(_) => { },
+    }
+    match (fs.open(file, "r")) {
+        Result.Err(_) => { },
+        Result.Ok(h) => {
+            var left: int = size;
+            var go: bool = true;
+            while (go && left > 0) {
+                let want: int = if (left < CHUNK) { left } else { CHUNK };
+                match (fs.read_bytes(h, want)) {
+                    Result.Err(_) => {
+                        go = false;
+                    },
+                    Result.Ok(chunk_opt) => {
+                        match (chunk_opt) {
+                            Option.None => {
+                                go = false;
+                            },
+                            Option.Some(chunk) => {
+                                match (net.socket_write_bytes(conn, chunk)) {
+                                    Result.Err(_) => {
+                                        go = false;
+                                    },
+                                    Result.Ok(_) => {
+                                        left = left - chunk.len();
+                                    },
+                                }
+                            },
+                        }
+                    },
+                }
+            }
+            close(h);
+        },
+    }
+}

@@ -1,0 +1,87 @@
+// Lectura de enteros dentro de un `bytes`. La base de todos los parsers de contenedores.
+// `b[i]` da el octeto como int en O(1), así que todo esto es aritmética, sin copias.
+
+/// Big-endian unsigned 16-bit at `i` (0 when out of bounds).
+pub fn be_u16(b: bytes, i: int) -> int {
+    if (i + 1 >= b.len()) {
+        return 0;
+    }
+    b[i] * 256 + b[i + 1]
+}
+
+/// Big-endian unsigned 32-bit at `i` (0 when out of bounds).
+pub fn be_u32(b: bytes, i: int) -> int {
+    if (i + 3 >= b.len()) {
+        return 0;
+    }
+    ((b[i] * 256 + b[i + 1]) * 256 + b[i + 2]) * 256 + b[i + 3]
+}
+
+/// Big-endian unsigned 64-bit at `i`. raylang's `int` is 64-bit signed, so a value with
+/// the top bit set would wrap; no real media file carries one.
+pub fn be_u64(b: bytes, i: int) -> int {
+    if (i + 7 >= b.len()) {
+        return 0;
+    }
+    be_u32(b, i) * 4294967296 + be_u32(b, i + 4)
+}
+
+/// Little-endian unsigned 16-bit at `i`.
+pub fn le_u16(b: bytes, i: int) -> int {
+    if (i + 1 >= b.len()) {
+        return 0;
+    }
+    b[i + 1] * 256 + b[i]
+}
+
+/// Little-endian unsigned 32-bit at `i`.
+pub fn le_u32(b: bytes, i: int) -> int {
+    if (i + 3 >= b.len()) {
+        return 0;
+    }
+    ((b[i + 3] * 256 + b[i + 2]) * 256 + b[i + 1]) * 256 + b[i]
+}
+
+/// The four ASCII characters at `i` as a string (`""` when out of bounds) — the shape of
+/// every chunk/atom tag in RIFF, MP4 and PNG.
+pub fn tag4(b: bytes, i: int) -> string {
+    if (i + 3 >= b.len()) {
+        return "";
+    }
+    match (from_utf8(b.sub_bytes(i, i + 4))) {
+        Result.Ok(s) => s,
+        Result.Err(_) => "",
+    }
+}
+
+/// A 28-bit synchsafe integer (ID3v2): four octets carrying 7 bits each.
+pub fn synchsafe(b: bytes, i: int) -> int {
+    if (i + 3 >= b.len()) {
+        return 0;
+    }
+    ((((b[i] % 128) * 128 + (b[i + 1] % 128)) * 128) + (b[i + 2] % 128)) * 128 + (b[i + 3] % 128)
+}
+
+@test
+fn integers_in_both_orders() {
+    let b: bytes = bytes_of([0x0, 0x0, 0x1, 0x0, 0x12, 0x34]);
+    assert_eq(be_u32(b, 0), 256);
+    assert_eq(le_u32(b, 0), 65536);
+    assert_eq(be_u16(b, 4), 0x1234);
+    assert_eq(le_u16(b, 4), 0x3412);
+    assert_eq(be_u32(b, 4), 0);
+}
+
+@test
+fn tags_and_synchsafe() {
+    assert_eq(tag4("moov".to_bytes(), 0), "moov");
+    assert_eq(tag4(b"ab", 0), "");
+    // 0x00 0x00 0x02 0x01 → 2 * 128 + 1
+    assert_eq(synchsafe(bytes_of([0, 0, 2, 1]), 0), 257);
+}
+
+@test
+fn sixty_four_bit_values() {
+    let b: bytes = bytes_of([0, 0, 0, 1, 0, 0, 0, 0]);
+    assert_eq(be_u64(b, 0), 4294967296);
+}

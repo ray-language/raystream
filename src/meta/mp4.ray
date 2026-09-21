@@ -1,0 +1,191 @@
+// MP4 / QuickTime: duración y dimensiones recorriendo el árbol de átomos.
+//
+// Un átomo es `[tamaño u32][tipo 4 ascii][cuerpo]`; tamaño 1 significa que el tamaño real
+// es un u64 que viene después, y 0 significa "hasta el final del fichero". Sólo se
+// necesitan `moov/mvhd` (duración) y `moov/trak/tkhd` (dimensiones del track de vídeo).
+import meta/binary;
+
+/// What the container header tells us.
+pub struct Mp4Info {
+    duration_ms: int,
+    width: int,
+    height: int,
+}
+
+/// Parses the atom tree. `data` must cover the `moov` atom: pass the head of the file
+/// (fast-start files) and, if that fails, its tail — many muxers put `moov` at the end.
+pub fn parse(data: bytes) -> Option<Mp4Info> {
+    match (find_atom(data, 0, data.len(), "moov")) {
+        Option.None => Option.None,
+        Option.Some(moov) => {
+            var info: Mp4Info = Mp4Info { duration_ms: 0, width: 0, height: 0 };
+            match (find_atom(data, moov.body, moov.end, "mvhd")) {
+                Option.Some(mvhd) => {
+                    info.duration_ms = mvhd_duration(data, mvhd.body);
+                },
+                Option.None => { },
+            }
+            read_tracks(data, moov.body, moov.end, info);
+            if (info.duration_ms == 0 && info.width == 0) {
+                Option.None
+            } else {
+                Option.Some(info)
+            }
+        },
+    }
+}
+
+// Un átomo localizado: dónde empieza su cuerpo y dónde acaba el átomo entero.
+struct Atom {
+    body: int,
+    end: int,
+}
+
+// Busca un átomo por tipo entre `from` y `limit` (un solo nivel, sin recursión).
+fn find_atom(data: bytes, from_pos: int, limit: int, want: string) -> Option<Atom> {
+    var pos: int = from_pos;
+    while (pos + 8 <= limit) {
+        var size: int = binary.be_u32(data, pos);
+        var body: int = pos + 8;
+        let kind: string = binary.tag4(data, pos + 4);
+        if (size == 1) {
+            size = binary.be_u64(data, pos + 8);
+            body = pos + 16;
+        } else if (size == 0) {
+            size = limit - pos;
+        }
+        if (size < 8) {
+            return Option.None;
+        }
+        let end: int = if (pos + size > limit) { limit } else { pos + size };
+        if (kind == want) {
+            return Option.Some(Atom { body: body, end: end });
+        }
+        pos = pos + size;
+    }
+    Option.None
+}
+
+// mvhd: versión 0 → timescale/duración de 32 bits; versión 1 → de 64.
+fn mvhd_duration(data: bytes, body: int) -> int {
+    if (body >= data.len()) {
+        return 0;
+    }
+    let version: int = data[body];
+    if (version == 1) {
+        let timescale: int = binary.be_u32(data, body + 20);
+        let duration: int = binary.be_u64(data, body + 24);
+        if (timescale <= 0) { 0 } else { duration * 1000 / timescale }
+    } else {
+        let timescale: int = binary.be_u32(data, body + 12);
+        let duration: int = binary.be_u32(data, body + 16);
+        if (timescale <= 0) { 0 } else { duration * 1000 / timescale }
+    }
+}
+
+// Recorre los `trak` y se queda con las dimensiones del primero que las tenga (el vídeo;
+// un track de audio lleva 0×0).
+fn read_tracks(data: bytes, from_pos: int, limit: int, info: Mp4Info) {
+    var pos: int = from_pos;
+    while (pos + 8 <= limit) {
+        var size: int = binary.be_u32(data, pos);
+        let kind: string = binary.tag4(data, pos + 4);
+        var body: int = pos + 8;
+        if (size == 1) {
+            size = binary.be_u64(data, pos + 8);
+            body = pos + 16;
+        } else if (size == 0) {
+            size = limit - pos;
+        }
+        if (size < 8) {
+            return;
+        }
+        let end: int = if (pos + size > limit) { limit } else { pos + size };
+        if (kind == "trak" && info.width == 0) {
+            match (find_atom(data, body, end, "tkhd")) {
+                Option.Some(tkhd) => {
+                    let dims: [int] = tkhd_dimensions(data, tkhd.body);
+                    if (dims[0] > 0) {
+                        info.width = dims[0];
+                        info.height = dims[1];
+                    }
+                },
+                Option.None => { },
+            }
+        }
+        pos = pos + size;
+    }
+}
+
+// tkhd: ancho y alto son los dos últimos campos, en coma fija 16.16.
+fn tkhd_dimensions(data: bytes, body: int) -> [int] {
+    if (body >= data.len()) {
+        return [0, 0];
+    }
+    let version: int = data[body];
+    // v0: 4 flags+version + 3*4 (creation/modification/track_id) + 4 reservado + 4 duración
+    //     + 8 reservado + 2 layer + 2 alternate + 2 volume + 2 reservado + 36 matriz = 76
+    // v1: los tres campos de tiempo son de 64 bits → 12 octetos más.
+    let offset: int = if (version == 1) { body + 88 } else { body + 76 };
+    let w: int = binary.be_u32(data, offset) / 65536;
+    let h: int = binary.be_u32(data, offset + 4) / 65536;
+    [w, h]
+}
+
+// Construye un átomo con su cabecera, para los tests.
+fn atom(kind: string, body: bytes) -> bytes {
+    let size: int = body.len() + 8;
+    bytes_of(
+        [(size / 16777216) % 256, (size / 65536) % 256, (size / 256) % 256, size % 256]
+    ) + kind.to_bytes() + body
+}
+
+fn be32(v: int) -> bytes {
+    bytes_of([(v / 16777216) % 256, (v / 65536) % 256, (v / 256) % 256, v % 256])
+}
+
+@test
+fn duration_and_dimensions_from_a_synthetic_moov() {
+    // mvhd v0: versión+flags, creation, modification, timescale, duration, …
+    var mvhd: bytes = bytes_of([0, 0, 0, 0]) + be32(0) + be32(0) + be32(1000) + be32(7500);
+    mvhd = mvhd + be32(0x10000) + bytes_of([1, 0, 0, 0]);
+
+    // tkhd v0 hasta el ancho/alto en 16.16.
+    var tkhd: bytes = bytes_of([0, 0, 0, 3]) + be32(0) + be32(0) + be32(1) + be32(0) + be32(5000);
+    tkhd = tkhd + be32(0) + be32(0);  // reservado
+    tkhd = tkhd + bytes_of([0, 0, 0, 0, 0, 0, 0, 0]);  // layer/alternate/volume/reservado
+    var m: int = 0;
+    while (m < 9) {
+        tkhd = tkhd + be32(0);  // matriz
+        m = m + 1;
+    }
+    tkhd = tkhd + be32(1920 * 65536) + be32(1080 * 65536);
+
+    let moov: bytes = atom("moov", atom("mvhd", mvhd) + atom("trak", atom("tkhd", tkhd)));
+    let file: bytes = atom("ftyp", b"isom") + moov;
+
+    match (parse(file)) {
+        Option.Some(info) => {
+            assert_eq(info.duration_ms, 7500);
+            assert_eq(info.width, 1920);
+            assert_eq(info.height, 1080);
+        },
+        Option.None => panic("moov should parse"),
+    }
+}
+
+@test
+fn a_file_without_moov_is_none() {
+    match (parse(atom("ftyp", b"isom") + atom("mdat", b"\x00\x00\x00\x00"))) {
+        Option.Some(_) => panic("no moov, no info"),
+        Option.None => { },
+    }
+}
+
+@test
+fn garbage_does_not_loop_forever() {
+    match (parse(bytes_of([0, 0, 0, 2, 65, 66, 67, 68, 9, 9]))) {
+        Option.Some(_) => panic("garbage is not an mp4"),
+        Option.None => { },
+    }
+}

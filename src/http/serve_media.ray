@@ -1,0 +1,72 @@
+// Servir un fichero de medios por la conexión.
+//
+// Desde net 0.3.0 el trabajo pesado lo hace `webserver.serve_file`: ETag fuerte de
+// tamaño+mtime, `If-None-Match` → 304, `Range`/206/416 con `If-Range` y, a partir de 1 MB,
+// el cuerpo leído del disco en trozos de 256 KB con `Content-Length` — nunca el fichero
+// entero en memoria. Es la respuesta del paquete a los hallazgos 2 y 3 de NOTES-raylang.md,
+// y hace innecesario el escritor que este módulo tenía a mano.
+//
+// Lo que sigue siendo nuestro: el `Content-Type` (el `mime_of` del paquete no conoce .mov,
+// .mkv, .m4a, .flac ni .ogg, y el índice sí sabe qué es cada fichero) y el HEAD, que
+// `send_response` no distingue.
+import std/fs;
+import net/webserver;
+
+/// What a transfer ended up doing, for the access log.
+pub struct Sent {
+    status: int,
+    length: int,
+}
+
+/// Serves `path` as the response to `req`, forcing `mime` as the content type.
+/// `is_head` answers with the headers alone.
+pub fn serve_file(
+    conn: int,
+    path: string,
+    mime: string,
+    req: webserver.Request,
+    is_head: bool
+) -> Result<Sent, string> {
+    let r: webserver.Response = if (is_head) { head_response(path, mime)? } else {
+        // Los valores por defecto (256 KB × cola 1) son los mejores medidos aquí: subir el
+        // trozo a 1 MB con `serve_file_with` triplicó el RSS sin mover el caudal.
+        let full: webserver.Response = webserver.serve_file(path, req);
+        full.headers.insert("Content-Type", mime);
+        full
+    };
+    r.headers.insert("Cache-Control", "private, max-age=3600");
+    webserver.send_response(conn, r)?;
+    Result.Ok(Sent { status: r.status, length: length_of(r) })
+}
+
+// Un HEAD se contesta desde los metadatos, sin abrir el fichero: `send_response` no sabe
+// que la petición era HEAD y escribiría el cuerpo entero (y con un cuerpo en streaming
+// dejaría además al productor colgado).
+//
+// El truco: una respuesta en streaming de longitud CONOCIDA cuyo canal se cierra sin
+// mandar nada. `stream_response_len` pone el `Content-Length` correcto —el que un GET
+// devolvería, como pide el RFC— y el escritor no bufferiza cuerpo alguno. Con
+// `bytes_response` no vale: el emisor calcula `Content-Length` del cuerpo (0) y el
+// nuestro saldría duplicado.
+fn head_response(path: string, mime: string) -> Result<webserver.Response, string> {
+    let st: fs.Stat = fs.stat(path)?;
+    let empty: Channel<bytes> = Channel.new();
+    close(empty);
+    let r: webserver.Response = webserver.stream_response_len(200, empty, st.size);
+    r.headers.insert("Content-Type", mime);
+    r.headers.insert("Accept-Ranges", "bytes");
+    r.headers.insert("ETag", "\"${st.size}-${st.mtime_ms}\"");
+    Result.Ok(r)
+}
+
+// Los octetos que va a llevar la respuesta, para el log: el cuerpo ya materializado o el
+// Content-Length que anunció el camino en streaming.
+fn length_of(r: webserver.Response) -> int {
+    if (r.body.len() > 0) {
+        return r.body.len();
+    }
+    match (r.headers.get("Content-Length")) {
+        Option.Some(v) => parse_int(v).unwrap_or(0),
+        Option.None => 0,
+    }
+}

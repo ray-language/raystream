@@ -1,0 +1,65 @@
+// Spike 0.A: ¿un closure que captura un Channel vale como handler de `serve_raw`?
+// Si compila y responde, el índice puede vivir en una fibra-actor alcanzable desde las
+// fibras de conexión. Si no, el índice va a disco con caché por mtime (plan B).
+import net/webserver;
+import std/net;
+import std/time;
+
+enum Ask {
+    Count(Channel<int>),
+}
+
+// El actor: guarda un contador y responde por el canal de respuesta que le mandan.
+fn counter_actor(inbox: Channel<Ask>) {
+    var n: int = 0;
+    var go: bool = true;
+    while (go) {
+        match (recv(inbox)) {
+            Option.None => {
+                go = false;
+            },
+            Option.Some(msg) => {
+                match (msg) {
+                    Ask.Count(reply) => {
+                        n = n + 1;
+                        send(reply, n);
+                    },
+                }
+            },
+        }
+    }
+}
+
+fn main() -> int {
+    let inbox: Channel<Ask> = Channel.new();
+    spawn(fn() {
+        counter_actor(inbox);
+    });
+
+    // El experimento: el handler captura `inbox` (un valor función que cruza a la fibra
+    // de conexión que crea `serve_raw`).
+    let handler = fn(req: webserver.Request, conn: int) {
+        let reply: Channel<int> = Channel.new();
+        send(inbox, Ask.Count(reply));
+        let n: int = match (recv(reply)) {
+            Option.Some(v) => v,
+            Option.None => 0 - 1,
+        };
+        let r: webserver.Response = webserver.text(200, "hits=${n}\n");
+        match (webserver.send_response(conn, r)) {
+            Result.Ok(_) => { },
+            Result.Err(e) => {
+                eprint("send: ${e}");
+            },
+        }
+    };
+
+    print("spike listening on 127.0.0.1:8099");
+    match (webserver.serve_raw("127.0.0.1", 8099, handler)) {
+        Result.Ok(_) => 0,
+        Result.Err(e) => {
+            eprint("serve_raw: ${e}");
+            1
+        },
+    }
+}

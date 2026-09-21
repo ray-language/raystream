@@ -1,0 +1,34 @@
+// Prueba de la sala sincronizada contra el servidor en marcha: dos clientes en la misma
+// sala y uno en otra. Lo que hace un cliente lo ve el compañero de sala, y sólo él.
+//   ray run spikes/room_client.ray
+import net/websocket_client as ws;
+import net/websocket;
+
+fn dial(path: string) -> websocket.WsConn {
+    match (ws.connect("127.0.0.1", 8080, path)) {
+        Result.Ok(c) => c,
+        Result.Err(e) => panic("connect ${path}: ${e}"),
+    }
+}
+
+fn main() -> int {
+    let alice = dial("/ws/room/salon");
+    let bob = dial("/ws/room/salon");
+    let eve = dial("/ws/room/cocina");
+
+    print("alice ← ${ws.recv_text(alice).unwrap_or("!")}");
+    print("bob   ← ${ws.recv_text(bob).unwrap_or("!")}");
+    print("eve   ← ${ws.recv_text(eve).unwrap_or("!")}");
+
+    print("alice → load + play");
+    ws.send_text(alice, "{\"type\":\"load\",\"item_id\":\"6a53a280b322\"}").unwrap_or(0);
+    ws.send_text(alice, "{\"type\":\"play\",\"position_ms\":4200}").unwrap_or(0);
+
+    print("bob   ← ${ws.recv_text(bob).unwrap_or("!")}");
+    print("bob   ← ${ws.recv_text(bob).unwrap_or("!")}");
+
+    ws.close_ws(alice);
+    ws.close_ws(bob);
+    ws.close_ws(eve);
+    0
+}

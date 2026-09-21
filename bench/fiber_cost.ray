@@ -1,0 +1,84 @@
+// ¿De dónde salen los 2,6 MB por conexión del camino productor→canal→escritor?
+// Se descompone en tres piezas, cada una medida desde fuera con el RSS del proceso.
+//
+//   baseline  — N trozos de 256 KB retenidos en la fibra principal. El dato, y nada más.
+//   fibers    — N fibras vivas que no hacen nada. El coste fijo de una fibra.
+//   channel   — N fibras, cada una con su canal acotado, que mandan UN trozo de 256 KB
+//               que la principal retiene. Fibra + canal + la copia al cruzar.
+//
+// Uso:  fiber_cost <baseline|fibers|channel> <n>
+// El programa monta el escenario, imprime "ready" y espera: el arnés muestrea entonces.
+import std/time;
+
+const CHUNK: int = 262144;
+
+fn main() -> int {
+    let argv: [string] = args();
+    if (argv.len() < 2) {
+        print("usage: fiber_cost <baseline|fibers|channel> <n>");
+        return 2;
+    }
+    let mode: string = argv[0];
+    let n: int = parse_int(argv[1]).unwrap_or(32);
+
+    // Un trozo de 256 KB, el mismo tamaño que usa el productor de estáticos.
+    var seed: [int] = [];
+    var k: int = 0;
+    while (k < CHUNK) {
+        seed.push(k % 256);
+        k = k + 1;
+    }
+    let chunk: bytes = bytes_of(seed);
+
+    if (mode == "baseline") {
+        var held: [bytes] = [];
+        var i: int = 0;
+        while (i < n) {
+            // Una copia distinta por iteración: sub_bytes del total fuerza octetos nuevos.
+            held.push(chunk.sub_bytes(0, CHUNK));
+            i = i + 1;
+        }
+        print("ready ${held.len()}");
+    } else if (mode == "fibers") {
+        let done: Channel<int> = Channel.new();
+        var i: int = 0;
+        while (i < n) {
+            spawn(fn() {
+                // Viva y parada: sólo su pila y su heap.
+                match (recv(done)) {
+                    Option.Some(_) => { },
+                    Option.None => { },
+                }
+            });
+            i = i + 1;
+        }
+        print("ready ${n}");
+    } else if (mode == "channel") {
+        var held: [bytes] = [];
+        var i: int = 0;
+        while (i < n) {
+            let ch: Channel<bytes> = Channel.bounded(1);
+            spawn(fn() {
+                send(ch, chunk);
+            });
+            match (recv(ch)) {
+                Option.Some(piece) => {
+                    held.push(piece);
+                },
+                Option.None => { },
+            }
+            i = i + 1;
+        }
+        print("ready ${held.len()}");
+    } else {
+        print("unknown mode");
+        return 2;
+    }
+
+    // Tercer argumento: milisegundos de espera (0 = salir ya, para el sondeo con --heap).
+    let hold: int = if (argv.len() > 2) { parse_int(argv[2]).unwrap_or(4000) } else { 4000 };
+    if (hold > 0) {
+        time.sleep(hold);
+    }
+    0
+}

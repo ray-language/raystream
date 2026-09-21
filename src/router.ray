@@ -1,0 +1,234 @@
+// El enrutado: de una ruta HTTP a una intención tipada. Puro y con tests; el servidor
+// sólo tiene que hacer `match` sobre el resultado.
+
+/// What a request path means. Everything the server can be asked for.
+@derive(Eq, Show)
+pub enum Route {
+    Home,
+    Asset(string),
+    ApiLibrary,
+    ApiItem(string),
+    ApiStats,
+    Media(string),
+    Thumb(string),
+    Subtitle(string, int),
+    Events,
+    Room(string),
+    NotFound,
+}
+
+/// Resolves a request path (without the query string) to a `Route`.
+pub fn resolve(path: string) -> Route {
+    let p: string = strip_trailing_slash(path);
+    if (p == "" || p == "/") {
+        return Route.Home;
+    }
+    let parts: [string] = p.split("/");
+    // `parts[0]` es siempre "" (la barra inicial).
+    if (parts.len() < 2) {
+        return Route.NotFound;
+    }
+    let head: string = parts[1];
+    if (head == "assets") {
+        if (parts.len() < 3) {
+            return Route.NotFound;
+        }
+        return Route.Asset(join_from(parts, 2));
+    }
+    if (head == "media") {
+        return one_arg(parts, fn(id: string) -> Route { Route.Media(id) });
+    }
+    if (head == "thumb") {
+        return one_arg(parts, fn(id: string) -> Route { Route.Thumb(id) });
+    }
+    if (head == "subs") {
+        // /subs/<id>/<índice de pista>
+        if (parts.len() == 4 && parts[2] != "") {
+            match (parse_int(parts[3])) {
+                Option.Some(index) => {
+                    if (index >= 0) {
+                        return Route.Subtitle(parts[2], index);
+                    }
+                },
+                Option.None => { },
+            }
+        }
+        return Route.NotFound;
+    }
+    if (head == "events") {
+        return if (parts.len() == 2) { Route.Events } else { Route.NotFound };
+    }
+    if (head == "ws") {
+        // /ws/room/<name>
+        if (parts.len() == 4 && parts[2] == "room" && parts[3] != "") {
+            return Route.Room(parts[3]);
+        }
+        return Route.NotFound;
+    }
+    if (head == "api") {
+        if (parts.len() == 3 && parts[2] == "library") {
+            return Route.ApiLibrary;
+        }
+        if (parts.len() == 3 && parts[2] == "stats") {
+            return Route.ApiStats;
+        }
+        if (parts.len() == 4 && parts[2] == "item" && parts[3] != "") {
+            return Route.ApiItem(parts[3]);
+        }
+        return Route.NotFound;
+    }
+    Route.NotFound
+}
+
+// /<head>/<arg> con un único argumento no vacío.
+fn one_arg(parts: [string], make: fn(string) -> Route) -> Route {
+    if (parts.len() == 3 && parts[2] != "") {
+        make(parts[2])
+    } else {
+        Route.NotFound
+    }
+}
+
+// Une los segmentos desde `from_index` con "/" (para rutas de asset con subdirectorios).
+fn join_from(parts: [string], from_index: int) -> string {
+    var out: string = "";
+    var i: int = from_index;
+    while (i < parts.len()) {
+        if (out != "") {
+            out = out + "/";
+        }
+        out = out + parts[i];
+        i = i + 1;
+    }
+    out
+}
+
+fn strip_trailing_slash(p: string) -> string {
+    if (p.len() > 1 && p.ends_with("/")) {
+        p.substring(0, p.len() - 1)
+    } else {
+        p
+    }
+}
+
+/// Splits a raw request target into path and query string (`"/a?b=c"` → `("/a", "b=c")`).
+pub fn split_query(target: string) -> [string] {
+    match (target.index_of("?")) {
+        Option.Some(i) => [target.substring(0, i), target.substring(i + 1, target.len())],
+        Option.None => [target, ""],
+    }
+}
+
+/// Reads one parameter out of a query string. Percent-decoding is applied to the value.
+pub fn query_param(query: string, name: string) -> string {
+    if (query == "") {
+        return "";
+    }
+    let pairs: [string] = query.split("&");
+    var i: int = 0;
+    while (i < pairs.len()) {
+        let pair: string = pairs[i];
+        i = i + 1;
+        match (pair.index_of("=")) {
+            Option.None => {
+                if (pair == name) {
+                    return "";
+                }
+            },
+            Option.Some(eq) => {
+                if (pair.substring(0, eq) == name) {
+                    return percent_decode(pair.substring(eq + 1, pair.len()));
+                }
+            },
+        }
+    }
+    ""
+}
+
+/// Percent-decoding of a query value, `+` included (`application/x-www-form-urlencoded`).
+pub fn percent_decode(s: string) -> string {
+    var out: bytes = b"";
+    var i: int = 0;
+    let chars: [char] = s.chars();
+    while (i < chars.len()) {
+        let c: char = chars[i];
+        if (c == '+') {
+            out = out + b" ";
+            i = i + 1;
+        } else if (c == '%' && i + 2 < chars.len()) {
+            let hi: int = hex_value(chars[i + 1]);
+            let lo: int = hex_value(chars[i + 2]);
+            if (hi < 0 || lo < 0) {
+                out = out + to_string(c).to_bytes();
+                i = i + 1;
+            } else {
+                out = out + bytes_of([hi * 16 + lo]);
+                i = i + 3;
+            }
+        } else {
+            out = out + to_string(c).to_bytes();
+            i = i + 1;
+        }
+    }
+    match (from_utf8(out)) {
+        Result.Ok(v) => v,
+        Result.Err(_) => s,
+    }
+}
+
+fn hex_value(c: char) -> int {
+    let n: int = char_code(c);
+    if (n >= 48 && n <= 57) {
+        n - 48
+    } else if (n >= 97 && n <= 102) {
+        n - 87
+    } else if (n >= 65 && n <= 70) {
+        n - 55
+    } else {
+        0 - 1
+    }
+}
+
+@test
+fn static_routes() {
+    assert_eq(resolve("/"), Route.Home);
+    assert_eq(resolve(""), Route.Home);
+    assert_eq(resolve("/api/library"), Route.ApiLibrary);
+    assert_eq(resolve("/api/stats"), Route.ApiStats);
+    assert_eq(resolve("/events"), Route.Events);
+}
+
+@test
+fn routes_with_parameters() {
+    assert_eq(resolve("/media/abc123"), Route.Media("abc123"));
+    assert_eq(resolve("/thumb/abc123"), Route.Thumb("abc123"));
+    assert_eq(resolve("/api/item/abc123"), Route.ApiItem("abc123"));
+    assert_eq(resolve("/ws/room/salon"), Route.Room("salon"));
+    assert_eq(resolve("/subs/abc123/0").show(), Route.Subtitle("abc123", 0).show());
+    assert_eq(resolve("/subs/abc123/2").show(), Route.Subtitle("abc123", 2).show());
+    assert_eq(resolve("/assets/app.css"), Route.Asset("app.css"));
+    assert_eq(resolve("/assets/img/logo.png"), Route.Asset("img/logo.png"));
+}
+
+@test
+fn unknown_shapes_are_not_found() {
+    assert_eq(resolve("/media"), Route.NotFound);
+    assert_eq(resolve("/media/"), Route.NotFound);
+    assert_eq(resolve("/api"), Route.NotFound);
+    assert_eq(resolve("/api/nope"), Route.NotFound);
+    assert_eq(resolve("/ws/room"), Route.NotFound);
+    assert_eq(resolve("/subs/abc123"), Route.NotFound);
+    assert_eq(resolve("/subs/abc123/x"), Route.NotFound);
+    assert_eq(resolve("/nope/nope"), Route.NotFound);
+}
+
+@test
+fn query_handling() {
+    let parts: [string] = split_query("/api/library?kind=video&q=star%20wars");
+    assert_eq(parts[0], "/api/library");
+    assert_eq(query_param(parts[1], "kind"), "video");
+    assert_eq(query_param(parts[1], "q"), "star wars");
+    assert_eq(query_param(parts[1], "missing"), "");
+    assert_eq(query_param("", "kind"), "");
+    assert_eq(query_param("q=a+b", "q"), "a b");
+}

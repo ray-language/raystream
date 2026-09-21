@@ -1,0 +1,206 @@
+// El catálogo compartido: vive en una fibra-actor y se consulta por canales.
+//
+// Las fibras tienen heaps aislados y lo que viaja por un canal se copia en profundidad,
+// así que ésta es la única forma de que todas las conexiones vean el mismo índice. El
+// closure del handler de `serve_raw` captura el `Store` (comprobado en spikes/closure_handler.ray).
+import catalog/library;
+from catalog/library import Item, Kind;
+
+// El protocolo del actor. Cada petición lleva el canal por el que quiere la respuesta.
+enum Ask {
+    List(Query),
+    Get(Lookup),
+    Replace([Item]),
+    Stats(Channel<[int]>),
+    Stop,
+}
+
+struct Query {
+    kind: string,
+    text: string,
+    reply: Channel<[Item]>,
+}
+
+struct Lookup {
+    id: string,
+    reply: Channel<[Item]>,
+}
+
+/// A handle to the catalog actor. Cheap to copy; every method is a round trip.
+pub struct Store {
+    inbox: Channel<Ask>,
+}
+
+/// Starts the catalog actor with an initial snapshot.
+pub fn start(items: [Item]) -> Store {
+    let inbox: Channel<Ask> = Channel.new();
+    spawn(fn() {
+        run(inbox, items);
+    });
+    Store { inbox: inbox }
+}
+
+// El bucle del actor: el único sitio donde el índice se lee y se escribe.
+fn run(inbox: Channel<Ask>, initial: [Item]) {
+    var items: [Item] = initial;
+    var go: bool = true;
+    while (go) {
+        match (recv(inbox)) {
+            Option.None => {
+                go = false;
+            },
+            Option.Some(msg) => {
+                match (msg) {
+                    Ask.Stop => {
+                        go = false;
+                    },
+                    Ask.Replace(fresh) => {
+                        items = fresh;
+                    },
+                    Ask.Stats(reply) => {
+                        send(reply, counts(items));
+                    },
+                    Ask.Get(lookup) => {
+                        send(lookup.reply, reply_for(items, lookup.id));
+                    },
+                    Ask.List(q) => {
+                        send(q.reply, filtered(items, q.kind, q.text));
+                    },
+                }
+            },
+        }
+    }
+}
+
+// Devuelve el item pedido como lista de 0 o 1 elementos (un Option por canal obligaría a
+// anotar el tipo en cada sitio; la lista es más simple de transportar).
+fn reply_for(items: [Item], id: string) -> [Item] {
+    var i: int = 0;
+    while (i < items.len()) {
+        if (items[i].id == id) {
+            return [items[i]];
+        }
+        i = i + 1;
+    }
+    []
+}
+
+fn filtered(items: [Item], kind: string, text: string) -> [Item] {
+    var out: [Item] = [];
+    var i: int = 0;
+    while (i < items.len()) {
+        let it: Item = items[i];
+        i = i + 1;
+        if (kind != "" && library.kind_name(it.kind) != kind) {
+            continue;
+        }
+        if (!library.matches(it, text)) {
+            continue;
+        }
+        out.push(it);
+    }
+    out
+}
+
+// [total, videos, audios, images, bytes]
+fn counts(items: [Item]) -> [int] {
+    var videos: int = 0;
+    var audios: int = 0;
+    var images: int = 0;
+    var total_bytes: int = 0;
+    var i: int = 0;
+    while (i < items.len()) {
+        let it: Item = items[i];
+        total_bytes = total_bytes + it.size;
+        match (it.kind) {
+            Kind.Video => {
+                videos = videos + 1;
+            },
+            Kind.Audio => {
+                audios = audios + 1;
+            },
+            Kind.Image => {
+                images = images + 1;
+            },
+        }
+        i = i + 1;
+    }
+    [items.len(), videos, audios, images, total_bytes]
+}
+
+/// The items matching a kind (`""` = any) and a free-text query (`""` = any).
+pub fn list(st: Store, kind: string, text: string) -> [Item] {
+    let reply: Channel<[Item]> = Channel.new();
+    send(st.inbox, Ask.List(Query { kind: kind, text: text, reply: reply }));
+    match (recv(reply)) {
+        Option.Some(v) => v,
+        Option.None => [],
+    }
+}
+
+/// One item by id. (Named `find_by_id` and not `get`: a `pub fn get` shadows the free
+/// builtin of the same name even inside the stdlib — see NOTES-raylang.md, hallazgo 1.)
+pub fn find_by_id(st: Store, id: string) -> Option<Item> {
+    let reply: Channel<[Item]> = Channel.new();
+    send(st.inbox, Ask.Get(Lookup { id: id, reply: reply }));
+    match (recv(reply)) {
+        Option.None => Option.None,
+        Option.Some(found) => {
+            if (found.len() == 0) {
+                Option.None
+            } else {
+                Option.Some(found[0])
+            }
+        },
+    }
+}
+
+/// Swaps the whole index (what the re-indexing fiber does after a change on disk).
+pub fn replace(st: Store, items: [Item]) {
+    send(st.inbox, Ask.Replace(items));
+}
+
+/// `[total, videos, audios, images, bytes]`.
+pub fn stats(st: Store) -> [int] {
+    let reply: Channel<[int]> = Channel.new();
+    send(st.inbox, Ask.Stats(reply));
+    match (recv(reply)) {
+        Option.Some(v) => v,
+        Option.None => [0, 0, 0, 0, 0],
+    }
+}
+
+/// Stops the actor (used by tests; the server never stops it).
+pub fn stop(st: Store) {
+    send(st.inbox, Ask.Stop);
+}
+
+@test
+fn the_actor_serves_queries() {
+    let a: Item = library.new_item("v/movie.mp4", Kind.Video, 10, 1);
+    var b: Item = library.new_item("m/song.mp3", Kind.Audio, 20, 2);
+    b.artist = "Bill Evans";
+    let st: Store = start([a, b]);
+
+    assert_eq(list(st, "", "").len(), 2);
+    assert_eq(list(st, "video", "").len(), 1);
+    assert_eq(list(st, "", "evans").len(), 1);
+    assert_eq(list(st, "audio", "movie").len(), 0);
+
+    match (find_by_id(st, a.id)) {
+        Option.Some(found) => assert_eq(found.rel, "v/movie.mp4"),
+        Option.None => panic("id should be found"),
+    }
+    match (find_by_id(st, "nope")) {
+        Option.Some(_) => panic("unknown id must not resolve"),
+        Option.None => { },
+    }
+
+    let s: [int] = stats(st);
+    assert_eq(s[0], 2);
+    assert_eq(s[4], 30);
+
+    replace(st, [a]);
+    assert_eq(list(st, "", "").len(), 1);
+    stop(st);
+}

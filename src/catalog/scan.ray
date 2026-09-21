@@ -1,0 +1,194 @@
+// El escaneo del directorio de medios: recorre el árbol y devuelve los items.
+// Único módulo del catálogo que toca el disco.
+import std/fs;
+import catalog/library;
+import subtitles;
+from catalog/library import Item, Kind, Track;
+
+/// Where the per-library cache lives (thumbnails, index snapshot): ignored while scanning.
+pub const CACHE_DIR: string = ".raystream";
+
+/// Walks `root` and returns one `Item` per media file found, sorted by relative path
+/// (`fs.list_dir` already sorts, and the walk is depth-first in that order).
+/// Hidden entries, the cache directory and symlinks are skipped.
+pub fn scan(root: string) -> Result<[Item], string> {
+    var out: [Item] = [];
+    var sidecars: [string] = [];
+    walk(root, "", out, sidecars)?;
+    attach_subtitles(out, sidecars);
+    Result.Ok(out)
+}
+
+// Asocia cada fichero de subtítulos con su vídeo: mismo nombre base, opcionalmente con
+// un código de idioma delante de la extensión (`movie.es.srt` → `movie.*`, idioma "es").
+fn attach_subtitles(items: [Item], sidecars: [string]) {
+    var s: int = 0;
+    while (s < sidecars.len()) {
+        let rel: string = sidecars[s];
+        s = s + 1;
+        let ext: string = library.extension_of(rel);
+        let without_ext: string = strip_extension(rel);
+        // Dos candidatos: con y sin sufijo de idioma.
+        let maybe_lang: string = library.extension_of(without_ext);
+        let has_lang: bool = subtitles.looks_like_language(maybe_lang);
+        let stem: string = if (has_lang) { strip_extension(without_ext) } else { without_ext };
+        let lang: string = if (has_lang) { maybe_lang.to_lower() } else { "" };
+
+        var i: int = 0;
+        while (i < items.len()) {
+            let it: Item = items[i];
+            i = i + 1;
+            match (it.kind) {
+                Kind.Image => {
+                    continue;
+                },
+                Kind.Audio => { },
+                Kind.Video => { },
+            }
+            if (strip_extension(it.rel) != stem) {
+                continue;
+            }
+            it.tracks.push(
+                Track { rel: rel, lang: lang, label: subtitles.language_label(lang), format: ext }
+            );
+        }
+    }
+}
+
+// Quita la última extensión de una ruta (`a/b.es.srt` → `a/b.es`).
+fn strip_extension(rel: string) -> string {
+    let ext: string = library.extension_of(rel);
+    if (ext == "") {
+        rel
+    } else {
+        rel.substring(0, rel.len() - ext.len() - 1)
+    }
+}
+
+// Recorre `root/prefix` acumulando en `out` (arrays con semántica de referencia: `push`
+// muta el mismo array que ve el llamante).
+fn walk(root: string, prefix: string, out: [Item], sidecars: [string]) -> Result<int, string> {
+    let dir: string = if (prefix == "") { root } else { root + "/" + prefix };
+    let names: [string] = fs.list_dir(dir)?;
+    var i: int = 0;
+    while (i < names.len()) {
+        let name: string = names[i];
+        i = i + 1;
+        if (name.starts_with(".")) {
+            continue;
+        }
+        let rel: string = if (prefix == "") { name } else { prefix + "/" + name };
+        let full: string = root + "/" + rel;
+        match (fs.stat(full)) {
+            Result.Err(_) => {
+                // Una entrada que desaparece entre el list_dir y el stat no es un error
+                // del escaneo: simplemente ya no está.
+                continue;
+            },
+            Result.Ok(st) => {
+                if (st.kind == "dir") {
+                    walk(root, rel, out, sidecars)?;
+                } else if (st.kind == "file") {
+                    let ext: string = library.extension_of(name);
+                    match (library.kind_of_extension(ext)) {
+                        Option.Some(k) => {
+                            out.push(library.new_item(rel, k, st.size, st.mtime_ms));
+                        },
+                        Option.None => {
+                            if (subtitles.is_subtitle(ext)) {
+                                sidecars.push(rel);
+                            }
+                        },
+                    }
+                }
+            },
+        }
+    }
+    Result.Ok(out.len())
+}
+
+/// Resolves an item's relative path to an absolute one, refusing anything that escapes
+/// the library root once symlinks are resolved. Every path that reaches the filesystem
+/// from a request goes through here.
+pub fn safe_path(root: string, rel: string) -> Result<string, string> {
+    if (rel == "" || rel.contains("..")) {
+        return Result.Err("invalid path");
+    }
+    let full: string = root + "/" + rel;
+    if (!fs.exists(full)) {
+        return Result.Err("not found");
+    }
+    let inside: bool = fs.is_within_real(full, root)?;
+    if (!inside) {
+        return Result.Err("outside the library");
+    }
+    fs.real_path(full)
+}
+
+@test
+fn scan_finds_media_and_skips_the_rest() {
+    let root: string = fs.make_temp_dir("raystream_scan").unwrap_or("");
+    assert(root != "");
+    fs.mkdir(root + "/sub").unwrap_or(0);
+    fs.mkdir(root + "/" + CACHE_DIR).unwrap_or(0);
+    fs.write_file(root + "/a.mp3", "x").unwrap_or(0);
+    fs.write_file(root + "/notes.txt", "x").unwrap_or(0);
+    fs.write_file(root + "/.hidden.mp3", "x").unwrap_or(0);
+    fs.write_file(root + "/sub/b.png", "xy").unwrap_or(0);
+    fs.write_file(root + "/" + CACHE_DIR + "/c.mp3", "x").unwrap_or(0);
+
+    let items: [Item] = scan(root).unwrap_or([]);
+    assert_eq(items.len(), 2);
+    assert_eq(items[0].rel, "a.mp3");
+    assert_eq(items[1].rel, "sub/b.png");
+    assert_eq(items[1].size, 2);
+    fs.remove_all(root).unwrap_or(0);
+}
+
+@test
+fn safe_path_refuses_traversal() {
+    let root: string = fs.make_temp_dir("raystream_safe").unwrap_or("");
+    fs.write_file(root + "/a.mp3", "x").unwrap_or(0);
+    match (safe_path(root, "a.mp3")) {
+        Result.Ok(p) => assert(p.ends_with("a.mp3")),
+        Result.Err(e) => panic("should resolve: ${e}"),
+    }
+    match (safe_path(root, "../etc/passwd")) {
+        Result.Ok(_) => panic("traversal must be refused"),
+        Result.Err(_) => { },
+    }
+    fs.remove_all(root).unwrap_or(0);
+}
+
+@test
+fn subtitles_attach_to_their_video() {
+    let root: string = fs.make_temp_dir("raystream_subs_scan").unwrap_or("");
+    fs.mkdir(root + "/video").unwrap_or(0);
+    fs.write_file(root + "/video/movie.mp4", "x").unwrap_or(0);
+    fs.write_file(root + "/video/movie.es.srt", "x").unwrap_or(0);
+    fs.write_file(root + "/video/movie.en.vtt", "x").unwrap_or(0);
+    fs.write_file(root + "/video/other.srt", "x").unwrap_or(0);
+    fs.write_file(root + "/video/talk.mkv", "x").unwrap_or(0);
+    fs.write_file(root + "/video/talk.srt", "x").unwrap_or(0);
+
+    let items: [Item] = scan(root).unwrap_or([]);
+    // Los .srt/.vtt no son items de la biblioteca.
+    assert_eq(items.len(), 2);
+
+    var movie: Item = items[0];
+    var talk: Item = items[1];
+    assert_eq(movie.rel, "video/movie.mp4");
+    assert_eq(movie.tracks.len(), 2);
+    assert_eq(movie.tracks[0].lang, "en");
+    assert_eq(movie.tracks[0].label, "English");
+    assert_eq(movie.tracks[0].format, "vtt");
+    assert_eq(movie.tracks[1].lang, "es");
+    assert_eq(movie.tracks[1].rel, "video/movie.es.srt");
+
+    // Sin código de idioma: una pista sin idioma, no un fallo.
+    assert_eq(talk.tracks.len(), 1);
+    assert_eq(talk.tracks[0].lang, "");
+    assert_eq(talk.tracks[0].label, "Subtitles");
+
+    fs.remove_all(root).unwrap_or(0);
+}

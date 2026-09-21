@@ -1,0 +1,219 @@
+// Subtítulos: descubrimiento de ficheros hermanos y conversión SRT → WebVTT.
+//
+// El elemento <track> del navegador sólo acepta WebVTT, así que un .srt se convierte al
+// vuelo: cabecera `WEBVTT`, comas de los milisegundos a puntos y saltos de línea
+// normalizados. Un .vtt se sirve tal cual (con su cabecera si le faltaba).
+import std/fs;
+
+/// Whether an extension is a subtitle sidecar.
+pub fn is_subtitle(ext: string) -> bool {
+    ext == "srt" || ext == "vtt"
+}
+
+/// The human label of a language code (`"es"` → `"Español"`). Unknown codes are shown
+/// uppercased, and an empty code is just "Subtitles".
+pub fn language_label(code: string) -> string {
+    let c: string = code.to_lower();
+    if (c == "") {
+        "Subtitles"
+    } else if (c == "es" || c == "spa") {
+        "Español"
+    } else if (c == "en" || c == "eng") {
+        "English"
+    } else if (c == "fr" || c == "fra" || c == "fre") {
+        "Français"
+    } else if (c == "de" || c == "deu" || c == "ger") {
+        "Deutsch"
+    } else if (c == "it" || c == "ita") {
+        "Italiano"
+    } else if (c == "pt" || c == "por") {
+        "Português"
+    } else if (c == "ca" || c == "cat") {
+        "Català"
+    } else if (c == "gl" || c == "glg") {
+        "Galego"
+    } else if (c == "eu" || c == "eus" || c == "baq") {
+        "Euskara"
+    } else if (c == "ja" || c == "jpn") {
+        "日本語"
+    } else {
+        c.to_upper()
+    }
+}
+
+/// Whether a trailing dotted piece of a file name looks like a language code
+/// (`movie.es.srt` → `es`). Two or three letters, nothing else.
+pub fn looks_like_language(piece: string) -> bool {
+    if (piece.len() < 2 || piece.len() > 3) {
+        return false;
+    }
+    var i: int = 0;
+    let lower: string = piece.to_lower();
+    while (i < lower.len()) {
+        let code: int = char_code(lower[i]);
+        if (code < 97 || code > 122) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+/// Reads a sidecar file and returns it as WebVTT, ready to serve.
+pub fn load_as_vtt(path: string, ext: string) -> Result<string, string> {
+    let raw: bytes = fs.read_file_bytes(path)?;
+    let text: string = decode(raw);
+    if (ext == "vtt") {
+        Result.Ok(ensure_header(text))
+    } else {
+        Result.Ok(srt_to_vtt(text))
+    }
+}
+
+// Los .srt del mundo real vienen en UTF-8 o en latin-1. Si no es UTF-8 válido, se
+// interpreta como latin-1 en lugar de fallar: un subtítulo con acentos raros es mejor
+// que ningún subtítulo.
+fn decode(raw: bytes) -> string {
+    let body: bytes = strip_bom(raw);
+    match (from_utf8(body)) {
+        Result.Ok(s) => s,
+        Result.Err(_) => latin1(body),
+    }
+}
+
+fn strip_bom(raw: bytes) -> bytes {
+    if (raw.len() >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF) {
+        raw.sub_bytes(3, raw.len())
+    } else {
+        raw
+    }
+}
+
+fn latin1(b: bytes) -> string {
+    var out: string = "";
+    var i: int = 0;
+    while (i < b.len()) {
+        match (char_from_code(b[i])) {
+            Option.Some(c) => {
+                out = out + to_string(c);
+            },
+            Option.None => { },
+        }
+        i = i + 1;
+    }
+    out
+}
+
+/// Converts SubRip to WebVTT. Cue numbers are dropped (WebVTT does not need them), the
+/// `,` of the timestamps becomes `.`, and CRLF endings are normalised.
+pub fn srt_to_vtt(srt: string) -> string {
+    let lines: [string] = srt.replace("\r\n", "\n").replace("\r", "\n").split("\n");
+    var out: string = "WEBVTT\n\n";
+    var i: int = 0;
+    while (i < lines.len()) {
+        let line: string = lines[i].trim();
+        i = i + 1;
+        if (line == "") {
+            continue;
+        }
+        if (is_timing(line)) {
+            out = out + convert_timing(line) + "\n";
+            // El texto del cue va hasta la siguiente línea en blanco.
+            while (i < lines.len() && lines[i].trim() != "") {
+                out = out + lines[i] + "\n";
+                i = i + 1;
+            }
+            out = out + "\n";
+        }
+        // Una línea suelta que no es tiempo es el número de cue: se descarta.
+    }
+    out
+}
+
+/// Adds the `WEBVTT` header when a .vtt file is missing it (some tools omit it).
+pub fn ensure_header(text: string) -> string {
+    let clean: string = text.replace("\r\n", "\n").replace("\r", "\n");
+    if (clean.trim().starts_with("WEBVTT")) {
+        clean
+    } else {
+        "WEBVTT\n\n" + clean
+    }
+}
+
+// Una línea de tiempos lleva la flecha entre dos marcas.
+fn is_timing(line: string) -> bool {
+    line.contains("-->")
+}
+
+// `00:00:01,000 --> 00:00:04,000` → `00:00:01.000 --> 00:00:04.000`, y una marca sin
+// hora (`01:02,500`, que WebVTT admite pero conviene normalizar) se deja como está.
+fn convert_timing(line: string) -> string {
+    line.replace(",", ".")
+}
+
+@test
+fn converts_a_subrip_file() {
+    let srt: string = `1
+00:00:01,000 --> 00:00:04,000
+Hola, mundo.
+
+2
+00:00:05,500 --> 00:00:08,250
+Dos líneas
+en un cue.
+`;
+    let vtt: string = srt_to_vtt(srt);
+    assert(vtt.starts_with("WEBVTT\n\n"));
+    assert(vtt.contains("00:00:01.000 --> 00:00:04.000"));
+    assert(vtt.contains("00:00:05.500 --> 00:00:08.250"));
+    assert(vtt.contains("Dos líneas\nen un cue."));
+    // Los números de cue no viajan.
+    assert(!vtt.contains("\n1\n"));
+}
+
+@test
+fn handles_crlf_and_missing_trailing_newline() {
+    let srt: string = "1\r\n00:00:01,000 --> 00:00:02,000\r\nUno\r\n";
+    let vtt: string = srt_to_vtt(srt);
+    assert(vtt.contains("00:00:01.000 --> 00:00:02.000\nUno\n"));
+    assert(!vtt.contains("\r"));
+}
+
+@test
+fn a_vtt_keeps_its_content() {
+    let vtt: string = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nYa era vtt\n";
+    assert_eq(ensure_header(vtt), vtt);
+    let headerless: string = "00:00:01.000 --> 00:00:02.000\nSin cabecera\n";
+    assert(ensure_header(headerless).starts_with("WEBVTT\n\n"));
+}
+
+@test
+fn language_codes() {
+    assert(looks_like_language("es"));
+    assert(looks_like_language("spa"));
+    assert(!looks_like_language("e"));
+    assert(!looks_like_language("spanish"));
+    assert(!looks_like_language("s1"));
+    assert_eq(language_label("es"), "Español");
+    assert_eq(language_label("EN"), "English");
+    assert_eq(language_label("zz"), "ZZ");
+    assert_eq(language_label(""), "Subtitles");
+}
+
+@test
+fn reads_a_sidecar_from_disk() {
+    let root: string = fs.make_temp_dir("raystream_subs").unwrap_or("");
+    fs.write_file(root + "/a.srt", "1\n00:00:01,000 --> 00:00:02,000\nTexto\n").unwrap_or(0);
+    match (load_as_vtt(root + "/a.srt", "srt")) {
+        Result.Ok(vtt) => {
+            assert(vtt.starts_with("WEBVTT"));
+            assert(vtt.contains("00:00:01.000 --> 00:00:02.000"));
+        },
+        Result.Err(e) => panic("should load: ${e}"),
+    }
+    match (load_as_vtt(root + "/missing.srt", "srt")) {
+        Result.Ok(_) => panic("a missing file must fail"),
+        Result.Err(_) => { },
+    }
+    fs.remove_all(root).unwrap_or(0);
+}

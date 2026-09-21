@@ -1,0 +1,17 @@
+// Spike: cuánta memoria cuesta servir un fichero grande con `webserver.static_mount`,
+// para contrastarlo con `src/http/serve_media.ray` (NOTES-raylang.md, hallazgo 2).
+// Se sirve el MISMO directorio y el MISMO fichero por los dos caminos.
+import net/webserver;
+
+fn main() -> int {
+    print("static_mount spike on 127.0.0.1:8098 (GET /media/video/big.mp4)");
+    match (webserver.serve("127.0.0.1", 8098, fn(req: webserver.Request) -> webserver.Response {
+        webserver.static_mount("/media/", "media", req)
+    })) {
+        Result.Ok(_) => 0,
+        Result.Err(e) => {
+            eprint(e);
+            1
+        },
+    }
+}
