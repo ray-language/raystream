@@ -146,3 +146,7 @@ curl -s "localhost:8080/subs/<id>/0" | head -4
 - La duración de un MP3 VBR es una estimación; la de MP4 y WAV es exacta.
 - Los subtítulos son ficheros hermanos: no se extraen las pistas incrustadas en el contenedor
   (haría falta demuxar MP4/Matroska).
+
+## Licencia
+
+MIT — ver [LICENSE](LICENSE).
