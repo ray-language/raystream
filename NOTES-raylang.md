@@ -11,8 +11,10 @@ Severidades: **bloqueante** (impide el caso de uso) · **fricción** (hay rodeo,
 
 ## Estado en raylang 1.27.4 / net 0.3.3 / web 0.4.2
 
-Revisados uno a uno reejecutando cada repro. **Diecinueve de veintitrés resueltos.** Quedan
-abiertos el 9 (JPEG), el 10 (bucles por píxel en la VM) y el 20 (el perfilador no mide memoria).
+Revisados uno a uno reejecutando cada repro. **Diecinueve de veintitrés resueltos.** De los tres
+restantes, ninguno afecta al funcionamiento del servidor: el **9** queda descartado por ahora (si se
+implementa será como librería Tier-2, no en `std`), el **20** está en estudio y diseño, y el **10**
+lo está revisando el equipo de raylang.
 El 19 sigue vivo como coste del lenguaje, pero ya no afecta a este servidor: `net` evita el canal
 por completo al servir ficheros (M279). El código de `net`/`web` cita los números de esta bitácora
 (`M271 (raystream [3])`, `M272 (raystream [4])`, `M275 (raystream [18])`).
@@ -27,8 +29,8 @@ por completo al servir ficheros (M279). El código de `net`/`web` cita los núme
 | 6 | `ray check` exigía `main` | ✅ resuelto — `ok: 'lib.ray' compiles (module without main)` |
 | 7 | `llms.txt` sin tipos de retorno | ✅ resuelto — documenta `b[i]`, `m.get`, y una sección "Return types that surprise" |
 | 8 | nombre de trait del prelude con posición inventada | ✅ resuelto — `1:1` de mi fichero, con extracto y mensaje corregido |
-| 9 | `std/image` sólo decodifica PNG | ⬜ sigue igual |
-| 10 | bucles por píxel lentos en la VM | ⬜ sigue igual (701 ms VM / 26 ms nativo) |
+| 9 | `std/image` sólo decodifica PNG | 🚫 descartado por ahora — si se hace, será una librería Tier-2 |
+| 10 | bucles por píxel lentos en la VM | 🔍 en revisión por el equipo de raylang — desglosado abajo: el grueso es `decode_png`, no el bucle del usuario |
 | 11 | `assert_eq` de enum derivado rompía el nativo | ✅ resuelto — compila, y `==` entre enums derivados ya funciona |
 | 12 | `to_string` no aceptaba `Show` | ✅ resuelto |
 | 13 | stubs que revientan en nativo | ✅ resuelto — el build del proyecto ya no emite el aviso |
@@ -38,7 +40,7 @@ por completo al servir ficheros (M279). El código de `net`/`web` cita los núme
 | 17 | `char_from_code` mal documentado | ✅ resuelto en 1.27.1 — `char_from_code(n) -> Option<char>` |
 | 18 | el productor de `serve_file` bufferizaba 1 MB por conexión | ✅ resuelto del todo en net 0.3.2 — el emisor lee el fichero en la propia fibra de la conexión (`FileBody`, M279): 177 KB por conexión frente a 152 KB del bucle a mano |
 | 19 | mover `bytes` por un canal cuesta 1,8× su tamaño | ⚠️ abierto en el lenguaje (486 KB medidos), pero `net` 0.3.2 ya no usa canal para servir ficheros |
-| 20 | el perfilador no mide memoria ni sirve en servidores | ⬜ abierto |
+| 20 | el perfilador no mide memoria ni sirve en servidores | 🔍 en estudio y diseño |
 | 21 | `import std/sort;` impedía compilar a nativo | ✅ resuelto en 1.27.3 |
 | 22 | `ray fmt` corrompía interpolaciones anidadas con `//` | ✅ resuelto en 1.27.3 |
 | 23 | `send_response` no sabía de HEAD: mandaba el cuerpo | ✅ resuelto en net 0.3.3 — `send_response_for(req, conn, r)` (M283) |
@@ -317,28 +319,35 @@ los reduce por CSS.
 
 ---
 
-### [10] Los bucles por píxel en la VM son caros — rendimiento · severidad: mejora
+### [10] El procesado de imagen en la VM es 20× más lento que en nativo — rendimiento · severidad: mejora · **en revisión**
 
-**Qué pasó:** reescalar un PNG con un filtro de caja (`src/thumbs.ray`) cuesta, para la MISMA
-imagen de 480×480 servida por `/thumb`:
+**Qué pasó:** servir la primera miniatura de un PNG de 480×480 cuesta **~700 ms en la VM** y
+**~19 ms en el binario nativo**. La cifra se mantiene desde 1.26.0 hasta 1.27.4.
 
-| Motor | Tiempo de la primera miniatura |
-|---|---|
-| VM (`ray run`) | **706 ms** |
-| binario nativo (`ray build --native`) | **16 ms** |
-| cacheada en disco | 0,4 ms |
+**Desglose** (`bench/pixel_loop.ray`, mismo trabajo que hace `/thumb`, sin servidor de por medio):
 
-43× de diferencia en aritmética entera sobre un `bytes`. En la VM son del orden de 1 µs por
-píxel-operación.
+| Etapa | VM | Nativo | Factor |
+|---|---|---|---|
+| `image.decode_png` (414 KB de entrada) | **477 ms** | 14 ms | 34× |
+| filtro de caja sobre RGBA (mi bucle) | 89 ms | 3 ms | 30× |
+| `image.encode_png` | 114 ms | 17 ms | 6,7× |
+| **total** | **680 ms** | **34 ms** | 20× |
 
-**Por qué importa:** cualquier procesado de imagen o audio en tiempo real queda fuera de la VM. En
-raystream se resuelve cacheando en disco (se paga una vez por fichero), pero una galería fría de 500
-fotos serían diez minutos de espera.
+El titular de las dos primeras versiones de esta nota —"los bucles por píxel del usuario son
+lentos"— era incompleto: **el 70% del coste está en `decode_png`**, que es código de la stdlib
+(inflate + desfiltrado de scanlines), no del programa. Mi bucle es sólo el 13%. Que `encode_png`
+sea el que menos empeora (6,7×) encaja con que el deflate del runtime sí está nativo (M253).
 
-**Propuesta:** documentar el orden de magnitud y la diferencia VM/nativo en `llms.txt` (para que uno
-diseñe con caché desde el principio y sepa que el nativo no es un detalle de despliegue sino la
-diferencia entre usable y no usable) y, si se puede, primitivas vectorizadas para `bytes` — un
-`map_bytes` o un acceso por bloques que no pase por el intérprete en cada octeto.
+**Por qué importa:** con esos números, cualquier procesado de imagen o audio en tiempo real queda
+fuera de la VM. En raystream se resuelve cacheando en disco —se paga una vez por fichero—, pero una
+galería fría de 500 fotos son seis minutos en `ray run` y veinte segundos en nativo.
+
+**Propuesta:** mirar primero `decode_png` (el bucle de desfiltrado por scanline, que es el patrón
+que más se repite), y documentar el orden de magnitud VM/nativo en `llms.txt`, para que uno diseñe
+con caché desde el principio y sepa que compilar nativo no es un detalle de despliegue.
+
+**Para medirlo:** `bench/pixel_loop.ray` imprime el desglose en ambos motores y acepta el lado de la
+imagen como argumento. El filtro que usa es el mismo de `src/thumbs.ray`, con un test que lo ata.
 
 ---
 

@@ -11,6 +11,7 @@ portarlo desde Python destapó el hallazgo 21 y corrigió dos conclusiones — v
 | `writer_ab.ray` | servidor con **los dos escritores** (bucle propio y `webserver.serve_file`) en el mismo binario |
 | `writer_ab_run.ray` | arnés del A/B: proceso nuevo por medida, delta sobre el reposo, varias rondas y mediana |
 | `fiber_cost.ray` | descompone el coste en memoria de una fibra, un trozo retenido y un trozo cruzando un canal |
+| `pixel_loop.ray` | el coste de una miniatura, etapa por etapa (`decode_png`, filtro, `encode_png`), en VM y en nativo |
 
 El RSS se lee llamando a `ps` porque raylang no expone la memoria del proceso (hallazgo 20).
 
@@ -80,6 +81,17 @@ fibra de la conexión, sin fibra productora ni canal.
 En 0.3.2 la diferencia se acaba: 177 KB contra 152 KB por conexión (1,16×) y el paquete va incluso
 un pelo más rápido que el bucle escrito a mano. El rodeo propio ya no tendría sentido ni por
 memoria ni por velocidad.
+
+### Coste de una miniatura (`pixel_loop.ray`, PNG de 480×480)
+
+| Etapa | VM | Nativo |
+|---|---|---|
+| `image.decode_png` | 477 ms | 14 ms |
+| filtro de caja (el bucle de `thumbs.ray`) | 89 ms | 3 ms |
+| `image.encode_png` | 114 ms | 17 ms |
+| **total** | **680 ms** | **34 ms** |
+
+El 70% del coste está en `decode_png`, no en el bucle del programa (hallazgo 10).
 
 ### Descomposición de memoria (`fiber_cost.ray`, runtime vacío 6,5 MB)
 

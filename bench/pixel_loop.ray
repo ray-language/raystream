@@ -1,0 +1,155 @@
+// El bucle caliente del hallazgo 10, aislado: el filtro de caja que reescala una imagen
+// RGBA (`src/thumbs.ray`), sin E/S, sin PNG y sin servidor. Es aritmética entera sobre un
+// `bytes` — el patrón de cualquier procesado de imagen, audio o formato binario.
+//
+//   ray run   bench/pixel_loop.ray            # VM
+//   ray build --native bench/pixel_loop.ray -o /tmp/pixel_loop && /tmp/pixel_loop
+//
+// Con un argumento se fija el lado de la imagen de origen (por defecto 480).
+import std/image;
+import std/time;
+
+/// Side of the generated source image, in pixels.
+const SIDE: int = 480;
+
+/// Longest side of the result: el mismo valor que usa `thumbs.MAX_SIDE`.
+const TARGET: int = 400;
+
+fn main() -> int {
+    let argv: [string] = args();
+    let side: int = if (argv.len() > 0) { parse_int(argv[0]).unwrap_or(SIDE) } else { SIDE };
+
+    // Origen sintético: un degradado, para no depender de ningún fichero.
+    let t_make: int = time.now();
+    var px: [int] = [];
+    var y: int = 0;
+    while (y < side) {
+        var x: int = 0;
+        while (x < side) {
+            px.push(x % 256);
+            px.push(y % 256);
+            px.push((x + y) % 256);
+            px.push(255);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    let pixels: bytes = bytes_of(px);
+    let make_ms: int = time.now() - t_make;
+
+    let t0: int = time.now();
+    let out: bytes = box_filter(pixels, side, side, TARGET);
+    let ms: int = time.now() - t0;
+
+    let source_px: int = side * side;
+    let per_px_ns: int = if (source_px > 0) { ms * 1000000 / source_px } else { 0 };
+    print("origen ${side}x${side} (${source_px} px) → ${TARGET} px de lado");
+    print("  construir la imagen: ${make_ms} ms");
+    print("  filtro de caja     : ${ms} ms · ${per_px_ns} ns por píxel de origen");
+    print("  salida             : ${out.len()} octetos");
+
+    // La miniatura completa, como la sirve el servidor: decodificar el PNG, filtrar y
+    // volver a codificar. Así se ve qué parte del coste es el bucle y qué parte std/image.
+    let src: image.Image = image.Image { width: side, height: side, pixels: pixels };
+    let t_enc0: int = time.now();
+    let png: bytes = image.encode_png(src).unwrap_or(b"");
+    let enc0_ms: int = time.now() - t_enc0;
+
+    let t_dec: int = time.now();
+    let decoded: image.Image = image.decode_png(png).unwrap_or(src);
+    let dec_ms: int = time.now() - t_dec;
+
+    let t_f: int = time.now();
+    let small: bytes = box_filter(decoded.pixels, decoded.width, decoded.height, TARGET);
+    let filter_ms: int = time.now() - t_f;
+
+    let t_enc: int = time.now();
+    let out_png: bytes = image
+        .encode_png(image.Image { width: TARGET, height: TARGET, pixels: small })
+        .unwrap_or(b"");
+    let enc_ms: int = time.now() - t_enc;
+
+    print("");
+    print("miniatura completa (lo que hace /thumb):");
+    print("  decode_png : ${dec_ms} ms   (${png.len()} octetos de entrada)");
+    print("  filtro     : ${filter_ms} ms");
+    print("  encode_png : ${enc_ms} ms   (${out_png.len()} octetos de salida)");
+    print("  total      : ${dec_ms + filter_ms + enc_ms} ms");
+    print("  (codificar el PNG de partida costó ${enc0_ms} ms, no cuenta)");
+    0
+}
+
+/// Downscales an RGBA buffer so its longest side is `target`, averaging each source block.
+/// Same arithmetic as `thumbs.downscale`, with nothing else around it.
+pub fn box_filter(pixels: bytes, width: int, height: int, target: int) -> bytes {
+    let longest: int = if (width > height) { width } else { height };
+    if (longest <= target) {
+        return pixels;
+    }
+    let w: int = width * target / longest;
+    let h: int = height * target / longest;
+    var out: [int] = [];
+    var y: int = 0;
+    while (y < h) {
+        let sy0: int = y * height / h;
+        let sy1: int = at_least(sy0 + 1, (y + 1) * height / h);
+        var x: int = 0;
+        while (x < w) {
+            let sx0: int = x * width / w;
+            let sx1: int = at_least(sx0 + 1, (x + 1) * width / w);
+            var r: int = 0;
+            var g: int = 0;
+            var b: int = 0;
+            var a: int = 0;
+            var n: int = 0;
+            var sy: int = sy0;
+            while (sy < sy1) {
+                var sx: int = sx0;
+                while (sx < sx1) {
+                    let at: int = (sy * width + sx) * 4;
+                    r = r + pixels[at];
+                    g = g + pixels[at + 1];
+                    b = b + pixels[at + 2];
+                    a = a + pixels[at + 3];
+                    n = n + 1;
+                    sx = sx + 1;
+                }
+                sy = sy + 1;
+            }
+            if (n == 0) {
+                n = 1;
+            }
+            out.push(r / n);
+            out.push(g / n);
+            out.push(b / n);
+            out.push(a / n);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    bytes_of(out)
+}
+
+fn at_least(floor_value: int, v: int) -> int {
+    if (v < floor_value) { floor_value } else { v }
+}
+
+@test
+fn the_filter_matches_the_server_one() {
+    // Un color plano sigue plano tras promediar, y las dimensiones salen del lado mayor.
+    var px: [int] = [];
+    var i: int = 0;
+    while (i < 100 * 100) {
+        px.push(10);
+        px.push(20);
+        px.push(30);
+        px.push(255);
+        i = i + 1;
+    }
+    let out: bytes = box_filter(bytes_of(px), 100, 100, 50);
+    assert_eq(out.len(), 50 * 50 * 4);
+    assert_eq(out[0], 10);
+    assert_eq(out[1], 20);
+    assert_eq(out[2], 30);
+    assert_eq(out[3], 255);
+}
