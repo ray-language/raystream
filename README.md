@@ -5,7 +5,9 @@ audio e imágenes y los sirve por HTTP con seek real, biblioteca viva y reproduc
 entre varios navegadores. Sin ffmpeg ni ningún otro binario externo.
 
 El proyecto es también un banco de pruebas del lenguaje: todo lo que roza o falta se anota en
-[NOTES-raylang.md](NOTES-raylang.md).
+[NOTES-raylang.md](NOTES-raylang.md) — 23 hallazgos hasta ahora, 19 ya resueltos aguas arriba.
+
+Probado con **raylang 1.27.4** y el paquete **net 0.3.3**.
 
 ## Arrancar
 
@@ -26,10 +28,10 @@ reiniciar.
 
 - **Streaming con `Range`**: `200`, `206` con `Content-Range` exacto, `416`, `ETag`/`304` e
   `If-Range`, leyendo del disco por trozos — la memoria no depende del tamaño del fichero y el
-  `<video>` del navegador salta por la barra sin recargar. Medido: **9,6 GB/s agregados con 32
-  descargas simultáneas y 22 MB de RSS** (ver [bench/](bench/README.md)). Lo sirve `webserver.serve_file`; este
-  proyecto pone el `Content-Type` del índice (el del paquete no conoce `.mov`, `.mkv`, `.m4a`,
-  `.flac` ni `.ogg`) y responde los `HEAD`.
+  `<video>` del navegador salta por la barra sin recargar. Medido: **9,1 GB/s agregados con 32
+  descargas simultáneas y 26 MB de RSS** (ver [bench/](bench/README.md)). Lo sirve
+  `webserver.serve_file`; lo único que pone este proyecto es el `Content-Type` del índice, porque el
+  `mime_of` del paquete no conoce `.mov`, `.mkv`, `.m4a`, `.flac` ni `.ogg`.
 - **Catálogo con metadatos**, todos parseados en raylang: duración y dimensiones de MP4
   (`moov`/`mvhd`/`tkhd`), duración exacta de WAV (RIFF), etiquetas y carátula de MP3 (ID3v2.2/2.3/2.4)
   con estimación de duración, y dimensiones de PNG, JPEG, GIF y WebP sin decodificar la imagen.
@@ -64,9 +66,11 @@ reiniciar.
 Un solo puerto sobre `webserver.serve_raw_limits`, con el handler escrito **inline** en la llamada
 —la forma que también compila a binario nativo— y una fibra por conexión. Se trabaja sobre la
 conexión cruda porque es lo que permite el upgrade a WebSocket y abrir un stream SSE; los ficheros
-los sirve `webserver.serve_file`, que desde `net` 0.3.0 hace ETag/304, `Range`/206/416 con
-`If-Range` y, por encima de 1 MB, lee del disco por trozos con `Content-Length` exacto. El enrutado
-y el catálogo son propios.
+los sirve `webserver.serve_file`, que resuelve ETag/304, `Range`/206/416 con `If-Range` y, por
+encima de 1 MB, lee del disco por trozos —en la propia fibra de la conexión, sin fibra productora
+ni canal— con `Content-Length` exacto. Las respuestas salen por `send_response_for`, que respeta el
+método: un `HEAD` lleva sus cabeceras y ningún octeto de cuerpo. El enrutado y el catálogo son
+propios.
 
 Cada conexión corre en su fibra. Como las fibras tienen heaps aislados, el estado compartido vive en
 actores y se habla con ellos por canales:
@@ -93,6 +97,7 @@ actores y se habla con ellos por canales:
 | `src/subtitles.ray` | descubrimiento de pistas y conversión SRT → WebVTT |
 | `src/thumbs.ray` | reescalado PNG y caché |
 | `src/samples.ray` | contenido de muestra |
+| `bench/` | el banco de pruebas, también en raylang: caudal, clientes lentos, A/B de escritores, coste de una miniatura y descomposición de memoria |
 | `spikes/` | experimentos sueltos que respaldan los hallazgos |
 
 ## Binario nativo
@@ -108,8 +113,8 @@ VM y **19 ms** en el binario nativo, y 0,4 ms si ya está cacheada.
 ## Tests
 
 ```sh
-ray test                      # la suite completa
-ray test src/http/range.ray   # un módulo
+ray test                        # la suite completa (48)
+ray test src/meta/id3.ray       # un módulo
 ```
 
 Y las comprobaciones que no son unitarias:
@@ -139,9 +144,11 @@ curl -s "localhost:8080/subs/<id>/0" | head -4
 - Sin transcodificación ni HLS: el navegador tiene que saber reproducir el formato tal cual (es la
   consecuencia de no usar ffmpeg).
 - Sin miniaturas de vídeo, por lo mismo.
-- Las miniaturas de JPEG son el fichero original: `std/image` sólo decodifica PNG.
-- Una petición por conexión (sin keep-alive), así que cada salto en la barra abre una conexión
-  nueva. El límite es de 128 conexiones simultáneas, y cada conexión larga (SSE, sala) ocupa una.
+- Las miniaturas de JPEG son el fichero original: `std/image` sólo decodifica PNG (y la decisión
+  aguas arriba es dejarlo fuera de `std`; si llega, será como librería Tier-2).
+- Una petición por conexión: el camino crudo de `net` cierra al responder (comprobado: la segunda
+  petición sobre el mismo socket no llega), así que cada salto en la barra abre una conexión nueva.
+  El límite es de 128 simultáneas, y cada conexión larga (SSE, sala) ocupa una de ellas.
 - La duración de un MP3 VBR es una estimación; la de MP4 y WAV es exacta.
 - Los subtítulos son ficheros hermanos: no se extraen las pistas incrustadas en el contenedor
   (haría falta demuxar MP4/Matroska).
