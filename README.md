@@ -26,7 +26,8 @@ reiniciar.
 
 - **Streaming con `Range`**: `200`, `206` con `Content-Range` exacto, `416`, `ETag`/`304` e
   `If-Range`, leyendo del disco por trozos — la memoria no depende del tamaño del fichero y el
-  `<video>` del navegador salta por la barra sin recargar. Lo sirve `webserver.serve_file`; este
+  `<video>` del navegador salta por la barra sin recargar. Medido: **9,6 GB/s agregados con 32
+  descargas simultáneas y 22 MB de RSS** (ver [bench/](bench/README.md)). Lo sirve `webserver.serve_file`; este
   proyecto pone el `Content-Type` del índice (el del paquete no conoce `.mov`, `.mkv`, `.m4a`,
   `.flac` ni `.ogg`) y responde los `HEAD`.
 - **Catálogo con metadatos**, todos parseados en raylang: duración y dimensiones de MP4
@@ -101,8 +102,8 @@ ray build --native -o raystream        # binario autónomo, con los assets horne
 ./raystream --dir ~/Movies --port 8080
 ```
 
-Merece la pena para cualquier uso real: la misma miniatura (PNG de 480×480) tarda **706 ms** en la
-VM y **16 ms** en el binario nativo, y 0,4 ms si ya está cacheada.
+Merece la pena para cualquier uso real: la misma miniatura (PNG de 480×480) tarda **700 ms** en la
+VM y **19 ms** en el binario nativo, y 0,4 ms si ya está cacheada.
 
 ## Tests
 
@@ -141,8 +142,8 @@ curl -s "localhost:8080/subs/<id>/0" | head -4
 - Las miniaturas de JPEG son el fichero original: `std/image` sólo decodifica PNG.
 - Una petición por conexión (sin keep-alive), así que cada salto en la barra abre una conexión
   nueva. El límite es de 128 conexiones simultáneas, y cada conexión larga (SSE, sala) ocupa una.
-- Cada transferencia mantiene ~1 MB en vuelo (el productor del paquete, hallazgo 18): 32 streams
-  simultáneos son ~144 MB de RSS.
+- Los `HEAD` de `/media` los responde este proyecto a mano: el emisor del paquete no conoce el
+  método y mandaría el cuerpo (hallazgo 23).
 - La duración de un MP3 VBR es una estimación; la de MP4 y WAV es exacta.
 - Los subtítulos son ficheros hermanos: no se extraen las pistas incrustadas en el contenedor
   (haría falta demuxar MP4/Matroska).

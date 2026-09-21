@@ -9,10 +9,12 @@ Las referencias `webserver.ray:N` son a `.ray-deps/net/webserver.ray` de esa ver
 Severidades: **bloqueante** (impide el caso de uso) · **fricción** (hay rodeo, cuesta tiempo) ·
 **mejora** (funciona, pero podría ser mejor).
 
-## Estado en raylang 1.27.1 / net 0.3.1 / web 0.4.0
+## Estado en raylang 1.27.3 / net 0.3.2 / web 0.4.2
 
-Revisados uno a uno reejecutando cada repro. **Dieciséis de veintidós resueltos**; quedan abiertos el
-9, el 10, el 19, el 20, el 21 y el 22. El código de `net`/`web` cita los números de esta bitácora
+Revisados uno a uno reejecutando cada repro. **Dieciocho de veintitrés resueltos.** Quedan abiertos
+el 9 (JPEG), el 10 (bucles por píxel en la VM), el 20 (el perfilador no mide memoria) y el 23
+(nuevo). El 19 sigue vivo como coste del lenguaje, pero ya no afecta a este servidor: `net` 0.3.2
+evita el canal por completo (M279). El código de `net`/`web` cita los números de esta bitácora
 (`M271 (raystream [3])`, `M272 (raystream [4])`, `M275 (raystream [18])`).
 
 | # | Hallazgo | Estado |
@@ -34,11 +36,12 @@ Revisados uno a uno reejecutando cada repro. **Dieciséis de veintidós resuelto
 | 15 | `const` sin arrays | ✅ resuelto |
 | 16 | `@derive(Show)` sin campos array | ✅ resuelto |
 | 17 | `char_from_code` mal documentado | ✅ resuelto en 1.27.1 — `char_from_code(n) -> Option<char>` |
-| 18 | el productor de `serve_file` bufferizaba 1 MB por conexión | ✅ resuelto en net 0.3.1 — cola por defecto 1 y `serve_file_with(file, req, chunk, queue)`; RSS a 32 clientes 144 → 86 MB |
-| 19 | mover `bytes` por un canal cuesta 1,8× su tamaño | ⬜ abierto |
+| 18 | el productor de `serve_file` bufferizaba 1 MB por conexión | ✅ resuelto del todo en net 0.3.2 — el emisor lee el fichero en la propia fibra de la conexión (`FileBody`, M279): 177 KB por conexión frente a 152 KB del bucle a mano |
+| 19 | mover `bytes` por un canal cuesta 1,8× su tamaño | ⚠️ abierto en el lenguaje (486 KB medidos), pero `net` 0.3.2 ya no usa canal para servir ficheros |
 | 20 | el perfilador no mide memoria ni sirve en servidores | ⬜ abierto |
-| 21 | `import std/sort;` impide compilar a nativo | ⬜ abierto |
-| 22 | `ray fmt` corrompe interpolaciones anidadas con `//` | ⬜ abierto |
+| 21 | `import std/sort;` impedía compilar a nativo | ✅ resuelto en 1.27.3 |
+| 22 | `ray fmt` corrompía interpolaciones anidadas con `//` | ✅ resuelto en 1.27.3 |
+| 23 | `send_response` no sabe de HEAD: manda el cuerpo | 🆕 nuevo (abajo) |
 
 Los rodeos de raystream (bucle de accept propio, `serve_media` sobre la conexión cruda, comparar
 `.show()` en los tests, `find_by_id` en vez de `get`) siguen siendo válidos, pero ya son **opcionales**:
@@ -727,3 +730,32 @@ nivel de anidamiento. Y una prueba de idempotencia en CI: `fmt(fmt(x)) == fmt(x)
 que habría cazado esto solo.
 
 **Rodeo aplicado:** sacar la URL a una variable antes de interpolarla.
+
+---
+
+### [23] `send_response` no puede responder un HEAD: manda el cuerpo entero — `net/webserver` · severidad: fricción · **nuevo**
+
+**Qué pasó:** `serve_file` construye bien la respuesta de un HEAD —`Content-Length` real,
+sin productor— pero el emisor público la escribe con cuerpo, porque `send_response(conn, r)` no
+recibe la petición y no puede saber el método. Medido con un socket crudo contra raystream
+dejando que el paquete resolviera el HEAD:
+
+```
+HEAD /media/<id> HTTP/1.1
+→ Content-Length: 701316 · y 701.316 octetos de cuerpo detrás de las cabeceras
+```
+
+`curl -I` no lo delata: deja de leer al acabar las cabeceras. Sólo se ve leyendo el socket hasta el
+cierre.
+
+**Por qué importa:** en el camino crudo (`serve_raw*` + `send_response`), que es el que usa
+cualquiera que necesite SSE, WebSocket o control del socket, **no hay forma de cumplir el RFC en un
+HEAD**. El servidor `serve()` sí lo hace: su bucle interno conoce el método y pasa `omit_body`. La
+capacidad existe, pero no está expuesta.
+
+**Propuesta:** `send_response_for(req: Request, conn: int, r: Response) -> Result<int, string>`
+—una línea, delega en el `omit_body` que ya existe— o un `send_response_head`.
+
+**Rodeo aplicado:** `src/http/serve_media.ray` responde los HEAD por su cuenta, con un
+`stream_response_len` cuyo canal nace cerrado: pone el `Content-Length` correcto y no escribe
+cuerpo. Verificado a nivel de socket: 0 octetos.

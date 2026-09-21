@@ -50,39 +50,48 @@ Compila siempre a nativo: en la VM el mismo banco da números que no se pueden c
 
 Mac mini M4 (Mac16,10), loopback, fichero de 256 MB, binario nativo.
 
-### Caudal y concurrencia (`throughput.ray`, raylang 1.27.1 / net 0.3.1)
+### Caudal y concurrencia (`throughput.ray`)
 
-| Clientes | Agregado | Por cliente | RSS pico |
-|---|---|---|---|
-| 1 | 5.333 MB/s | 5.333 MB/s | 18,6 MB |
-| 4 | 4.472 MB/s | 1.118 MB/s | 26,8 MB |
-| 16 | 4.108 MB/s | 257 MB/s | 44,3 MB |
-| 32 | 3.899 MB/s | 122 MB/s | 87,1 MB |
+| Clientes | 1.27.1 / net 0.3.1 | **1.27.3 / net 0.3.2** |
+|---|---|---|
+| 1 | 5.333 MB/s · RSS 18,6 MB | 5.689 MB/s · RSS 16,8 MB |
+| 4 | 4.472 MB/s · RSS 26,8 MB | 9.846 MB/s · RSS 18,5 MB |
+| 16 | 4.108 MB/s · RSS 44,3 MB | 9.615 MB/s · RSS 20,8 MB |
+| 32 | 3.899 MB/s · RSS 87,1 MB | **9.626 MB/s · RSS 22,0 MB** |
 
-| Prueba | Resultado |
-|---|---|
-| `Range` pequeño, secuencial | 0,14 ms · 7.142 req/s |
-| `Range` pequeño, 16 en paralelo | 11.130 req/s |
-| `Range` pequeño, 64 en paralelo | 14.222 req/s |
-| `/api/library` (pasa por el actor) | 0,16 ms · 6.122 req/s |
-| 24 clientes lentos | RSS +13,6 MB · `/api/stats` en 1 ms · `Range` de 64 KB en <1 ms |
+| Prueba | 1.27.1 / net 0.3.1 | 1.27.3 / net 0.3.2 |
+|---|---|---|
+| `Range` pequeño, secuencial | 0,14 ms · 7.142 req/s | 0,11 ms · 8.823 req/s |
+| `Range` pequeño, 16 en paralelo | 11.130 req/s | 15.058 req/s |
+| `Range` pequeño, 64 en paralelo | 14.222 req/s | 21.333 req/s |
+| `/api/library` (pasa por el actor) | 0,16 ms · 6.122 req/s | 0,15 ms · 6.521 req/s |
+| Miniatura PNG 480×480 (primera) | 26 ms nativo · 701 ms VM | 19 ms nativo · 700 ms VM |
+
+Con 32 clientes: **2,5× de caudal y 4× menos memoria** que la versión anterior, sin tocar una línea
+del servidor. El cambio es `FileBody` (M279 de `net` 0.3.2): el emisor lee el fichero en la propia
+fibra de la conexión, sin fibra productora ni canal.
 
 ### A/B de escritores (`writer_ab_run.ray`, 32 clientes, mediana de 3 rondas)
 
-| Escritor | Reposo | Pico | Delta | Por conexión | Caudal |
-|---|---|---|---|---|---|
-| `direct` (bucle propio, un trozo, sin fibra) | 9,0 MB | 26,4 MB | **17,4 MB** | **557 KB** | 4.721 MB/s |
-| `package` (`webserver.serve_file`) | 12,6 MB | 63,9 MB | **51,1 MB** | **1.638 KB** | 4.708 MB/s |
+| Escritor | Por conexión (net 0.3.1) | Caudal (0.3.1) | **Por conexión (0.3.2)** | **Caudal (0.3.2)** |
+|---|---|---|---|---|
+| `direct` (bucle propio, sin fibra) | 557 KB | 4.721 MB/s | **152 KB** | **8.410 MB/s** |
+| `package` (`webserver.serve_file`) | 1.638 KB | 4.708 MB/s | **177 KB** | **8.623 MB/s** |
 
-**2,9× de memoria por conexión, y el caudal es el mismo** (0,3% de diferencia, dentro del ruido).
+En 0.3.2 la diferencia se acaba: 177 KB contra 152 KB por conexión (1,16×) y el paquete va incluso
+un pelo más rápido que el bucle escrito a mano. El rodeo propio ya no tendría sentido ni por
+memoria ni por velocidad.
 
 ### Descomposición de memoria (`fiber_cost.ray`, runtime vacío 6,5 MB)
 
-| Escenario | Por unidad |
-|---|---|
-| retener un trozo de 256 KB | 267 KB |
-| una fibra viva parada | 54 KB |
-| fibra + canal `bounded(1)` + un trozo cruzándolo | 490 KB |
+| Escenario | 1.27.1 | 1.27.3 |
+|---|---|---|
+| retener un trozo de 256 KB | 267 KB | 267 KB |
+| una fibra viva parada | 54 KB | 52 KB |
+| fibra + canal `bounded(1)` + un trozo cruzándolo | 490 KB | 486 KB |
+
+Sin cambios: cruzar un canal sigue costando 1,8× la carga (hallazgo 19). Lo que cambió es que
+`net` ya no pasa los ficheros por un canal.
 
 Ver hallazgos 18, 19 y 20 en [../NOTES-raylang.md](../NOTES-raylang.md).
 
