@@ -183,8 +183,7 @@ pub fn new_item(rel: string, kind: Kind, size: int, mtime_ms: int) -> Item {
 
 /// The JSON of one item, as the API serves it.
 pub fn item_json(it: Item) -> string {
-    json
-        .obj()
+    json.obj()
         .field("id", it.id)
         .field("name", it.name)
         .field("rel", it.rel)
@@ -209,8 +208,7 @@ fn track_objects(it: Item) -> [json.Obj] {
     var i: int = 0;
     while (i < it.tracks.len()) {
         let t: Track = it.tracks[i];
-        out.push(json
-            .obj()
+        out.push(json.obj()
             .field("lang", t.lang)
             .field("label", t.label)
             .field("url", "/subs/${it.id}/${i}"));
@@ -279,9 +277,9 @@ fn kinds_and_mimes() {
 fn item_json_has_the_api_shape() {
     let it: Item = new_item("music/song.mp3", Kind.Audio, 1234, 99);
     let s: string = item_json(it);
-    assert(s.contains("\"kind\": \"audio\""));
-    assert(s.contains("\"size\": 1234"));
-    assert(s.contains("\"name\": \"song.mp3\""));
+    assert_eq(json_str(s, "kind"), "audio");
+    assert_eq(json_int(s, "size"), 1234);
+    assert_eq(json_str(s, "name"), "song.mp3");
 }
 
 @test
@@ -291,4 +289,28 @@ fn search_matches_metadata() {
     assert(matches(it, "miles"));
     assert(matches(it, ""));
     assert(!matches(it, "coltrane"));
+}
+
+// Lee un campo de un JSON ya serializado. Los tests comprueban valores, no el formato:
+// `json.render` cambió su espaciado entre versiones y los tests que comparaban texto se
+// rompieron sin que cambiara nada del comportamiento.
+fn json_str(text: string, key: string) -> string {
+    match (json.parse(text)) {
+        Result.Ok(j) => json.get_string(j, key).unwrap_or("<ausente>"),
+        Result.Err(e) => "<json inválido: ${e}>",
+    }
+}
+
+fn json_int(text: string, key: string) -> int {
+    match (json.parse(text)) {
+        Result.Ok(j) => json.get_int(j, key).unwrap_or(0 - 1),
+        Result.Err(_) => 0 - 1,
+    }
+}
+
+fn json_bool(text: string, key: string) -> bool {
+    match (json.parse(text)) {
+        Result.Ok(j) => json.get_bool(j, key).unwrap_or(false),
+        Result.Err(_) => false,
+    }
 }

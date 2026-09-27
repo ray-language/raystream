@@ -1,0 +1,7 @@
+// [8] Un tipo con nombre de trait del prelude: error en ESTE fichero, con su línea real.
+struct Sub { v: int, }
+
+fn main() -> int {
+    print(Sub { v: 1 }.v);
+    0
+}

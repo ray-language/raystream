@@ -1,0 +1,2 @@
+// [6] Un módulo de librería (sin `main`) debe poder pasar `ray check`.
+pub fn double(x: int) -> int { x * 2 }

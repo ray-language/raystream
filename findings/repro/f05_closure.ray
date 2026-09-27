@@ -1,0 +1,14 @@
+// [5] Un closure con estado GUARDADO EN UNA VARIABLE y pasado a `serve_raw` no puede
+// compilar a nativo: el error tiene que venir de raylang, con su explicación, no de rustc.
+import net/webserver;
+
+fn main() -> int {
+    let inbox: Channel<int> = Channel.new();
+    let handler = fn(req: webserver.Request, conn: int) {
+        send(inbox, 1);
+    };
+    match (webserver.serve_raw("127.0.0.1", 0, handler)) {
+        Result.Ok(_) => 0,
+        Result.Err(_) => 1,
+    }
+}

@@ -3,7 +3,7 @@ name = "raystream"
 version = "0.1.0"
 
 [dependencies]
-net = "^0.3.0"
+net = "^0.4.1"
 
 [native]
 embed = ["assets"]

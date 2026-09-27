@@ -1,0 +1,8 @@
+// [12] `to_string` sobre un tipo con Show.
+@derive(Show)
+enum Route { Home, }
+
+fn main() -> int {
+    print(to_string(Route.Home));
+    0
+}

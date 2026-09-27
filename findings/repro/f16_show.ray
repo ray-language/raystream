@@ -1,0 +1,11 @@
+// [16] @derive(Show) con un campo array de structs.
+@derive(Show)
+struct Track { lang: string, }
+
+@derive(Show)
+struct Item { name: string, tracks: [Track], }
+
+fn main() -> int {
+    print(Item { name: "a", tracks: [Track { lang: "es" }] });
+    0
+}

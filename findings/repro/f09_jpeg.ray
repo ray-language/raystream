@@ -1,0 +1,10 @@
+// [9] ¿Decodifica std/image algo más que PNG? (Descartado por decisión: sería Tier-2.)
+import std/image;
+
+fn main() -> int {
+    match (image.decode_jpeg(b"")) {
+        Result.Ok(_) => print("jpeg"),
+        Result.Err(_) => print("jpeg-api"),
+    }
+    0
+}

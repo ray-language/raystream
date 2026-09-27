@@ -1,0 +1,7 @@
+// [15] Constantes de módulo de tipo array.
+const EXTENSIONS: [string] = ["srt", "vtt"];
+
+fn main() -> int {
+    print(EXTENSIONS[1]);
+    0
+}

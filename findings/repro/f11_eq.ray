@@ -1,0 +1,11 @@
+// [11] `==` y `assert_eq` sobre un enum con @derive(Eq), también en binario nativo.
+@derive(Eq, Show)
+enum Route { Home, Media(string), }
+
+fn main() -> int {
+    assert_eq(Route.Media("a"), Route.Media("a"));
+    if (Route.Home == Route.Home) {
+        print("eq-ok");
+    }
+    0
+}

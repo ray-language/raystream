@@ -1,0 +1,15 @@
+// [1] Un `get` propio en la raíz no debe romper `std/json`, y ambos deben funcionar.
+import std/json;
+
+pub struct Box { v: int, }
+
+pub fn get(b: Box, key: string) -> int { b.v }
+
+fn main() -> int {
+    match (json.parse("{\"a\": 1}")) {
+        Result.Ok(j) => print(json.stringify(j)),
+        Result.Err(e) => print(e),
+    }
+    print(get(Box { v: 7 }, "x"));
+    0
+}

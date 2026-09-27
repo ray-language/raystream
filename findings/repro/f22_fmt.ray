@@ -1,0 +1,10 @@
+// [22] `ray fmt` no debe tocar una interpolación anidada que contenga `//`.
+fn tag(s: string) -> string {
+    s
+}
+
+fn main() -> int {
+    let origin: string = "127.0.0.1:8080";
+    print("latencia: ${tag("http://${origin}/api")} ms");
+    0
+}

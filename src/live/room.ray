@@ -160,8 +160,7 @@ fn apply(st: RoomState, ch: Change) {
 }
 
 fn state_json(st: RoomState, kind: string) -> string {
-    json
-        .obj()
+    json.obj()
         .field("type", kind)
         .field("room", st.name)
         .field("item_id", st.item_id)
@@ -304,9 +303,9 @@ fn a_room_broadcasts_state_to_its_members() {
     let _o: int = recv(ro).unwrap_or(0);
 
     // Al entrar, cada uno recibe el estado inicial de SU sala.
-    assert(recv(a).unwrap_or("").contains("\"room\": \"salon\""));
-    assert(recv(b).unwrap_or("").contains("\"room\": \"salon\""));
-    assert(recv(other).unwrap_or("").contains("\"room\": \"cocina\""));
+    assert_eq(json_str(recv(a).unwrap_or(""), "room"), "salon");
+    assert_eq(json_str(recv(b).unwrap_or(""), "room"), "salon");
+    assert_eq(json_str(recv(other).unwrap_or(""), "room"), "cocina");
 
     send(
         rooms.inbox,
@@ -321,12 +320,12 @@ fn a_room_broadcasts_state_to_its_members() {
         )
     );
 
-    assert(recv(a).unwrap_or("").contains("\"item_id\": \"abc\""));
+    assert_eq(json_str(recv(a).unwrap_or(""), "item_id"), "abc");
     let played: string = recv(a).unwrap_or("");
-    assert(played.contains("\"playing\": true"));
-    assert(played.contains("\"position_ms\": 4200"));
+    assert(json_bool(played, "playing"));
+    assert_eq(json_int(played, "position_ms"), 4200);
     // El otro miembro de la sala ve lo mismo…
-    assert(recv(b).unwrap_or("").contains("\"item_id\": \"abc\""));
+    assert_eq(json_str(recv(b).unwrap_or(""), "item_id"), "abc");
     // …y la sala de al lado no se entera.
     match (try_recv(other)) {
         Received.Got(v) => panic("another room got ${v}"),
@@ -353,10 +352,34 @@ fn leaving_stops_the_updates() {
     // Una consulta posterior confirma que el actor sigue vivo y con el estado aplicado.
     let ask: Channel<string> = Channel.new();
     send(rooms.inbox, RoomMsg.Snapshot(Ask { room: "r", reply: ask }));
-    assert(recv(ask).unwrap_or("").contains("\"playing\": true"));
+    assert(json_bool(recv(ask).unwrap_or(""), "playing"));
     match (try_recv(a)) {
         Received.Got(v) => panic("a member who left got ${v}"),
         Received.Empty => { },
         Received.Closed => { },
+    }
+}
+
+// Lee un campo de un JSON ya serializado. Los tests comprueban valores, no el formato:
+// `json.render` cambió su espaciado entre versiones y los tests que comparaban texto se
+// rompieron sin que cambiara nada del comportamiento.
+fn json_str(text: string, key: string) -> string {
+    match (json.parse(text)) {
+        Result.Ok(j) => json.get_string(j, key).unwrap_or("<ausente>"),
+        Result.Err(e) => "<json inválido: ${e}>",
+    }
+}
+
+fn json_int(text: string, key: string) -> int {
+    match (json.parse(text)) {
+        Result.Ok(j) => json.get_int(j, key).unwrap_or(0 - 1),
+        Result.Err(_) => 0 - 1,
+    }
+}
+
+fn json_bool(text: string, key: string) -> bool {
+    match (json.parse(text)) {
+        Result.Ok(j) => json.get_bool(j, key).unwrap_or(false),
+        Result.Err(_) => false,
     }
 }
