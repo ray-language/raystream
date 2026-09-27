@@ -219,16 +219,15 @@ fn track_objects(it: Item) -> [json.Obj] {
 
 /// The JSON array of a list of items.
 pub fn items_json(items: [Item]) -> string {
-    var out: string = "[";
+    // Las piezas se juntan UNA vez al final: concatenar sobre un `string` que crece copia
+    // todo lo anterior en cada vuelta — cuadrático, 4,3 s por petición con 20.000 items.
+    var parts: [string] = [];
     var i: int = 0;
     while (i < items.len()) {
-        if (i > 0) {
-            out = out + ",";
-        }
-        out = out + item_json(items[i]);
+        parts.push(item_json(items[i]));
         i = i + 1;
     }
-    out + "]"
+    "[" + join(parts, ",") + "]"
 }
 
 /// Whether an item matches a free-text query (name, title, artist and album).

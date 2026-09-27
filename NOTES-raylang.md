@@ -9,45 +9,52 @@ Las referencias `webserver.ray:N` son a `.ray-deps/net/webserver.ray` de esa ver
 Severidades: **bloqueante** (impide el caso de uso) · **fricción** (hay rodeo, cuesta tiempo) ·
 **mejora** (funciona, pero podría ser mejor).
 
-## Estado en raylang 1.27.4 / net 0.3.3 / web 0.4.2
+## Estado en raylang 1.27.16 / net 0.4.1 / web 0.4.5
 
-Revisados uno a uno reejecutando cada repro. **Diecinueve de veintitrés resueltos.** De los tres
-restantes, ninguno afecta al funcionamiento del servidor: el **9** queda descartado por ahora (si se
-implementa será como librería Tier-2, no en `std`), el **20** está en estudio y diseño, y el **10**
-lo está revisando el equipo de raylang.
-El 19 sigue vivo como coste del lenguaje, pero ya no afecta a este servidor: `net` evita el canal
-por completo al servir ficheros (M279). El código de `net`/`web` cita los números de esta bitácora
-(`M271 (raystream [3])`, `M272 (raystream [4])`, `M275 (raystream [18])`).
+Verificado el 2026-09-27 con el comprobador automático, `findings/check.ray`, que ejecuta un repro
+mínimo por hallazgo contra la versión instalada (≈15 s):
 
-| # | Hallazgo | Estado |
-|---|---|---|
-| 1 | `pub fn get` rompía `std/json` | ✅ resuelto — el override es léxico a la raíz (M270); la stdlib conserva el suyo |
-| 2 | `static_mount` leía el fichero entero | ✅ resuelto — camino perezoso (`fs.open`+`seek`+`read_bytes`) por encima de 1 MB |
-| 3 | streaming sin `Content-Length` | ✅ resuelto — `stream_response_len(status, ch, length)` |
-| 4 | `web` sin salida a streaming | ✅ resuelto — `r.stream`, `r.stream_len` y `r.sendfile` en web 0.4.0 |
-| 5 | handler con estado no compilaba a nativo | ✅ resuelto — existe `serve_raw_with`, y el caso prohibido ahora es un error de **raylang**, no de rustc |
-| 6 | `ray check` exigía `main` | ✅ resuelto — `ok: 'lib.ray' compiles (module without main)` |
-| 7 | `llms.txt` sin tipos de retorno | ✅ resuelto — documenta `b[i]`, `m.get`, y una sección "Return types that surprise" |
-| 8 | nombre de trait del prelude con posición inventada | ✅ resuelto — `1:1` de mi fichero, con extracto y mensaje corregido |
-| 9 | `std/image` sólo decodifica PNG | 🚫 descartado por ahora — si se hace, será una librería Tier-2 |
-| 10 | bucles por píxel lentos en la VM | 🔍 en revisión por el equipo de raylang — desglosado abajo: el grueso es `decode_png`, no el bucle del usuario |
-| 11 | `assert_eq` de enum derivado rompía el nativo | ✅ resuelto — compila, y `==` entre enums derivados ya funciona |
-| 12 | `to_string` no aceptaba `Show` | ✅ resuelto |
-| 13 | stubs que revientan en nativo | ✅ resuelto — el build del proyecto ya no emite el aviso |
-| 14 | `ray fmt` recortaba los ceros del hex | ✅ resuelto — `0x0D, 0x0A` se conservan |
-| 15 | `const` sin arrays | ✅ resuelto |
-| 16 | `@derive(Show)` sin campos array | ✅ resuelto |
-| 17 | `char_from_code` mal documentado | ✅ resuelto en 1.27.1 — `char_from_code(n) -> Option<char>` |
-| 18 | el productor de `serve_file` bufferizaba 1 MB por conexión | ✅ resuelto del todo en net 0.3.2 — el emisor lee el fichero en la propia fibra de la conexión (`FileBody`, M279): 177 KB por conexión frente a 152 KB del bucle a mano |
-| 19 | mover `bytes` por un canal cuesta 1,8× su tamaño | ⚠️ abierto en el lenguaje (486 KB medidos), pero `net` 0.3.2 ya no usa canal para servir ficheros |
-| 20 | el perfilador no mide memoria ni sirve en servidores | 🔍 en estudio y diseño |
-| 21 | `import std/sort;` impedía compilar a nativo | ✅ resuelto en 1.27.3 |
-| 22 | `ray fmt` corrompía interpolaciones anidadas con `//` | ✅ resuelto en 1.27.3 |
-| 23 | `send_response` no sabía de HEAD: mandaba el cuerpo | ✅ resuelto en net 0.3.3 — `send_response_for(req, conn, r)` (M283) |
+```
+18 OK · 0 abiertos o en regresión · 5 por decisión, medición o fuera de alcance
+```
 
-Los rodeos de raystream (bucle de accept propio, `serve_media` sobre la conexión cruda, comparar
-`.show()` en los tests, `find_by_id` en vez de `get`) siguen siendo válidos, pero ya son **opcionales**:
-se pueden revertir a la API del paquete cuando interese.
+**Ninguna regresión**: todo lo resuelto en versiones anteriores sigue resuelto en 1.27.16. De los que
+no son OK, ninguno afecta al funcionamiento del servidor: el **9** queda fuera de `std` por decisión
+(si llega, será librería Tier-2), el **20** está en estudio y diseño, el **10** lo está revisando el
+equipo de raylang, y el **19** sigue siendo un coste del lenguaje que `net` ya evita al servir
+ficheros. El código de raylang cita esta bitácora (`M271 (raystream [3])`, `M275 (raystream [17])`,
+`M283 (raystream [23])`…), y `llms.txt` tiene ahora una guarda en CI (`tests/llms_signatures.rs`)
+que coteja cada firma que cita contra la real — la propuesta del 17.
+
+| # | Hallazgo | Estado en 1.27.16 | Cómo se verificó |
+|---|---|---|---|
+| 1 | `pub fn get` rompía `std/json` | ✅ OK | repro: ambos `get` conviven |
+| 2 | `static_mount` leía el fichero entero | ✅ OK | un Range de 11 octetos no carga el fichero |
+| 3 | streaming sin `Content-Length` | ✅ OK | `stream_response_len` lo anuncia |
+| 4 | `web` sin salida a streaming | ✅ OK | web 0.4.5: `stream`, `stream_len`, `sendfile`, `sendfile_with` |
+| 5 | handler con estado no compilaba a nativo | ✅ OK | error de raylang (no de rustc) y `serve_raw_with` |
+| 6 | `ray check` exigía `main` | ✅ OK | `compiles (module without main)` |
+| 7 | `llms.txt` sin tipos de retorno | ✅ OK | `llms.txt` de v1.27.16 + guarda en CI |
+| 8 | trait del prelude con posición inventada | ✅ OK | error en `2:1` del fichero del usuario |
+| 9 | `std/image` sólo decodifica PNG | 🚫 decisión | fuera de `std`; si llega, Tier-2 |
+| 10 | procesado de imagen lento en la VM | 🔍 en revisión | 691 ms VM · 32 ms nativo (`bench/pixel_loop.ray`) |
+| 11 | `assert_eq` de enum derivado rompía el nativo | ✅ OK | el binario nativo ejecuta el repro |
+| 12 | `to_string` no aceptaba `Show` | ✅ OK | repro |
+| 13 | stubs que revientan en nativo | ✅ OK | el proyecto compila sin el aviso |
+| 14 | `ray fmt` recortaba los ceros del hex | ✅ OK | `0x0D, 0x0A` se conservan |
+| 15 | `const` sin arrays | ✅ OK | repro |
+| 16 | `@derive(Show)` sin campos array | ✅ OK | repro |
+| 17 | `char_from_code` mal documentado | ✅ OK | `llms.txt` de v1.27.16 |
+| 18 | el productor de `serve_file` bufferizaba 1 MB | ✅ OK | `serve_file` devuelve un `FileBody`; A/B: 187 KB/conexión frente a 174 KB del bucle a mano |
+| 19 | `bytes` cruzando un canal: 1,8× su tamaño | ⚠️ coste del lenguaje | 480 KB frente a 266 KB (`bench/fiber_cost.ray`); ya no afecta a `net` |
+| 20 | el perfilador no mide memoria | 🔍 en diseño | el JSON sigue siendo tiempo y llamadas |
+| 21 | `import std/sort` rompía el nativo | ✅ OK | compila |
+| 22 | `ray fmt` corrompía interpolaciones anidadas | ✅ OK | tres pasadas de `fmt -w` no cambian el fichero |
+| 23 | `send_response` no sabía de HEAD | ✅ OK | `send_response_for` |
+
+Una nota de compatibilidad que no es un hallazgo: entre 1.27.4 y 1.27.16 `json.render` dejó de poner
+espacio tras los dos puntos (`{"k":"v"}`). Rompió cuatro tests de raystream que comparaban texto
+serializado; el fallo era de los tests, que ahora parsean el JSON y comprueban valores.
 
 ---
 

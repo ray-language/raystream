@@ -31,7 +31,14 @@ pub fn probe(path: string, it: Item) {
 }
 
 fn probe_image(path: string, it: Item) {
-    let head: bytes = read_window(path, 0, 65536);
+    // 32 octetos bastan para PNG, GIF y WebP. Sólo un JPEG necesita más: su marcador SOF
+    // puede venir detrás de un bloque EXIF, así que para él se lee hasta 64 KB.
+    let small: bytes = read_window(path, 0, 32);
+    let head: bytes = if (small.starts_with(bytes_of([0xFF, 0xD8]))) {
+        read_window(path, 0, 65536)
+    } else {
+        small
+    };
     match (imagemeta.parse(head)) {
         Option.Some(d) => {
             it.width = d.width;
@@ -56,22 +63,118 @@ fn probe_audio(path: string, it: Item) {
         probe_video(path, it);
         return;
     }
-    // MP3 y demás: etiquetas ID3 y duración estimada.
-    let head: bytes = read_window(path, 0, HEAD_WINDOW);
-    let tag_bytes: int = id3.tag_size(head);
-    let tag_data: bytes = if (tag_bytes > head.len()) {
-        read_window(path, 0, tag_bytes)
-    } else {
-        head
-    };
-    let tags: id3.Tags = id3.parse(tag_data);
-    it.title = tags.title;
-    it.artist = tags.artist;
-    it.album = tags.album;
-    it.has_cover = tags.cover.len() > 0;
-    if (ext == "mp3") {
-        it.duration_ms = id3.mp3_duration_ms(head, it.size);
+    // MP3 y demás: etiquetas ID3 y duración estimada, leyendo sólo cabeceras.
+    probe_id3(path, it, ext == "mp3");
+}
+
+// Recorre la etiqueta ID3 de cabecera en cabecera de marco: lee el cuerpo de los marcos de
+// texto (pequeños) y SALTA el de la carátula, que sólo hace falta saber que existe. Después
+// lee una ventana corta donde empieza el audio para la duración.
+//
+// La versión anterior leía 256 KB de cada fichero, releía la etiqueta entera si la carátula
+// era mayor, y copiaba la imagen a memoria para descartarla: 300 µs por MP3 real y ~5 GB de
+// lectura para 20.000 canciones (bench/probe_real.ray).
+fn probe_id3(path: string, it: Item, want_duration: bool) {
+    match (fs.open(path, "r")) {
+        Result.Err(_) => { },
+        Result.Ok(h) => {
+            var audio_start: int = 0;
+            match (id3.header_of(read_at(h, 0, 14))) {
+                Option.None => { },
+                Option.Some(hd) => {
+                    audio_start = hd.total;
+                    walk_frames(h, hd, it);
+                },
+            }
+            if (want_duration) {
+                let window: bytes = read_at(h, audio_start, AUDIO_WINDOW);
+                it.duration_ms = id3.duration_from(window, it.size - audio_start);
+            }
+            close(h);
+        },
     }
+}
+
+fn walk_frames(h: int, hd: id3.Header, it: Item) {
+    let header_len: int = id3.frame_header_len(hd.major);
+    var pos: int = hd.first_frame;
+    while (pos + header_len <= hd.total) {
+        let fh: id3.FrameHeader = id3.frame_header_of(read_at(h, pos, header_len), hd.major);
+        // Relleno o fin de marcos: el resto de la etiqueta son ceros.
+        if (fh.id == "" || fh.id.starts_with("\0") || fh.size <= 0) {
+            return;
+        }
+        let body: int = pos + header_len;
+        if (body + fh.size > hd.total) {
+            return;
+        }
+        let field: string = id3.field_of(fh.id);
+        if (field == "cover") {
+            // Un APIC puede venir vacío: sólo cuenta si hay octetos de imagen detrás de su
+            // cabecera (MIME, tipo y descripción), igual que en el parser completo.
+            let prefix: bytes = read_at(h, body, min_int(fh.size, PICTURE_PREFIX));
+            let start: int = id3.picture_data_offset(prefix, fh.id == "PIC");
+            if (start >= 0 && fh.size > start) {
+                it.has_cover = true;
+            }
+        } else if (field != "") {
+            let text: string = id3.text_value(read_at(h, body, min_int(fh.size, TEXT_FRAME_MAX)));
+            if (field == "title") {
+                it.title = text;
+            } else if (field == "artist") {
+                it.artist = text;
+            } else {
+                it.album = text;
+            }
+        }
+        pos = body + fh.size;
+    }
+}
+
+/// Octets read from an APIC body to find where its image data starts.
+const PICTURE_PREFIX: int = 512;
+
+/// Longest text frame body read (titles and names; anything longer is cut).
+const TEXT_FRAME_MAX: int = 4096;
+
+/// Octets read where the audio starts, looking for the first MPEG frame header.
+const AUDIO_WINDOW: int = 4096;
+
+// `n` octetos a partir de `offset` en un fichero ya abierto (menos si se acaba).
+fn read_at(h: int, offset: int, n: int) -> bytes {
+    match (fs.seek(h, offset)) {
+        Result.Err(_) => b"",
+        Result.Ok(_) => {
+            var out: bytes = b"";
+            var go: bool = true;
+            while (go && out.len() < n) {
+                match (fs.read_bytes(h, n - out.len())) {
+                    Result.Err(_) => {
+                        go = false;
+                    },
+                    Result.Ok(piece) => {
+                        match (piece) {
+                            Option.None => {
+                                go = false;
+                            },
+                            Option.Some(chunk) => {
+                                if (chunk.len() == 0) {
+                                    go = false;
+                                } else {
+                                    out = out + chunk;
+                                }
+                            },
+                        }
+                    },
+                }
+            }
+            out
+        },
+    }
+}
+
+fn min_int(a: int, b: int) -> int {
+    if (a < b) { a } else { b }
 }
 
 fn probe_video(path: string, it: Item) {
@@ -201,5 +304,80 @@ fn read_window_respects_its_bounds() {
     assert_eq(read_window(root + "/x.bin", 0, 4), b"0123");
     assert_eq(read_window(root + "/x.bin", 6, 100), b"6789");
     assert_eq(read_window(root + "/missing", 0, 10), b"");
+    fs.remove_all(root).unwrap_or(0);
+}
+
+@test
+fn the_lean_mp3_probe_agrees_with_the_full_parser() {
+    let root: string = fs.make_temp_dir("raystream_lean").unwrap_or("");
+    // ID3v2.3 con título, artista, álbum y una carátula de 200 KB DELANTE de los textos,
+    // para que el recorrido tenga que saltarla; luego una trama MPEG-1 Layer III a 128 kbps.
+    var picture: [int] = [];
+    var p: int = 0;
+    while (p < 204800) {
+        picture.push(p % 251);
+        p = p + 1;
+    }
+    let apic: bytes = bytes_of([0])
+        + b"image/jpeg"
+        + bytes_of([0, 3])
+        + b"x"
+        + bytes_of([0])
+        + bytes_of(picture);
+    let frames: bytes = id3_frame("APIC", apic)
+        + id3_frame("TIT2", bytes_of([0]) + b"Lean")
+        + id3_frame("TPE1", bytes_of([0]) + b"Probe")
+        + id3_frame("TALB", bytes_of([0]) + b"Album");
+    let n: int = frames.len();
+    let tag: bytes = b"ID3" + bytes_of(
+        [3, 0, 0, (n / 2097152) % 128, (n / 16384) % 128, (n / 128) % 128, n % 128]
+    ) + frames;
+    var fill: [int] = [];
+    var f: int = 0;
+    while (f < 100000) {
+        fill.push(0);
+        f = f + 1;
+    }
+    let file: bytes = tag + bytes_of([0xFF, 0xFB, 0x90, 0x00]) + bytes_of(fill);
+    fs.write_file_bytes(root + "/s.mp3", file).unwrap_or(0);
+
+    var it: Item = library.new_item("s.mp3", Kind.Audio, file.len(), 0);
+    probe(root + "/s.mp3", it);
+
+    let full: id3.Tags = id3.parse(file);
+    assert_eq(it.title, full.title);
+    assert_eq(it.artist, full.artist);
+    assert_eq(it.album, full.album);
+    assert_eq(it.title, "Lean");
+    assert(it.has_cover);
+    assert_eq(it.duration_ms, id3.mp3_duration_ms(file, file.len()));
+    fs.remove_all(root).unwrap_or(0);
+}
+
+fn id3_frame(id: string, body: bytes) -> bytes {
+    let n: int = body.len();
+    id.to_bytes()
+        + bytes_of([(n / 16777216) % 256, (n / 65536) % 256, (n / 256) % 256, n % 256])
+        + bytes_of([0, 0])
+        + body
+}
+
+@test
+fn an_empty_apic_frame_is_not_a_cover() {
+    let root: string = fs.make_temp_dir("raystream_apic").unwrap_or("");
+    // Un APIC con MIME, tipo y descripción, pero sin octetos de imagen.
+    let apic: bytes = bytes_of([0]) + b"image/jpeg" + bytes_of([0, 3]) + b"x" + bytes_of([0]);
+    let frames: bytes = id3_frame("TIT2", bytes_of([0]) + b"Sin imagen") + id3_frame("APIC", apic);
+    let n: int = frames.len();
+    let file: bytes = b"ID3"
+        + bytes_of([3, 0, 0, 0, 0, (n / 128) % 128, n % 128])
+        + frames
+        + bytes_of([0xFF, 0xFB, 0x90, 0x00]);
+    fs.write_file_bytes(root + "/e.mp3", file).unwrap_or(0);
+    var it: Item = library.new_item("e.mp3", Kind.Audio, file.len(), 0);
+    probe(root + "/e.mp3", it);
+    assert_eq(it.title, "Sin imagen");
+    assert(!it.has_cover);
+    assert_eq(id3.parse(file).cover.len(), 0);
     fs.remove_all(root).unwrap_or(0);
 }

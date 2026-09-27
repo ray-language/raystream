@@ -1,14 +1,21 @@
 // El catálogo compartido: vive en una fibra-actor y se consulta por canales.
 //
 // Las fibras tienen heaps aislados y lo que viaja por un canal se copia en profundidad,
-// así que ésta es la única forma de que todas las conexiones vean el mismo índice. El
-// closure del handler de `serve_raw` captura el `Store` (comprobado en spikes/closure_handler.ray).
+// así que ésta es la única forma de que todas las conexiones vean el mismo índice.
+//
+// El actor mantiene, junto a los items, dos derivados que se recalculan sólo cuando cambia
+// el índice (no en cada petición):
+//   - `by_id`: id → posición. Cada petición de medios busca su item; recorrer la lista era
+//     O(N) por cada salto del reproductor.
+//   - `rendered`: el JSON de cada item ya serializado. `/api/library` sólo tiene que unir
+//     cadenas; serializar 20.000 items por petición costaba 152 ms (bench/library_scale.ray).
 import catalog/library;
 from catalog/library import Item, Kind;
 
 // El protocolo del actor. Cada petición lleva el canal por el que quiere la respuesta.
 enum Ask {
     List(Query),
+    ListJson(JsonQuery),
     Get(Lookup),
     Replace([Item]),
     Stats(Channel<[int]>),
@@ -21,9 +28,22 @@ struct Query {
     reply: Channel<[Item]>,
 }
 
+struct JsonQuery {
+    kind: string,
+    text: string,
+    reply: Channel<string>,
+}
+
 struct Lookup {
     id: string,
     reply: Channel<[Item]>,
+}
+
+// El estado del actor: los items y lo que se deriva de ellos.
+struct Index {
+    items: [Item],
+    rendered: [string],
+    by_id: Map<string, int>,
 }
 
 /// A handle to the catalog actor. Cheap to copy; every method is a round trip.
@@ -42,7 +62,7 @@ pub fn start(items: [Item]) -> Store {
 
 // El bucle del actor: el único sitio donde el índice se lee y se escribe.
 fn run(inbox: Channel<Ask>, initial: [Item]) {
-    var items: [Item] = initial;
+    var index: Index = build_index(initial);
     var go: bool = true;
     while (go) {
         match (recv(inbox)) {
@@ -55,16 +75,19 @@ fn run(inbox: Channel<Ask>, initial: [Item]) {
                         go = false;
                     },
                     Ask.Replace(fresh) => {
-                        items = fresh;
+                        index = build_index(fresh);
                     },
                     Ask.Stats(reply) => {
-                        send(reply, counts(items));
+                        send(reply, counts(index.items));
                     },
                     Ask.Get(lookup) => {
-                        send(lookup.reply, reply_for(items, lookup.id));
+                        send(lookup.reply, reply_for(index, lookup.id));
                     },
                     Ask.List(q) => {
-                        send(q.reply, filtered(items, q.kind, q.text));
+                        send(q.reply, filtered(index.items, q.kind, q.text));
+                    },
+                    Ask.ListJson(q) => {
+                        send(q.reply, filtered_json(index, q.kind, q.text));
                     },
                 }
             },
@@ -72,34 +95,62 @@ fn run(inbox: Channel<Ask>, initial: [Item]) {
     }
 }
 
-// Devuelve el item pedido como lista de 0 o 1 elementos (un Option por canal obligaría a
-// anotar el tipo en cada sitio; la lista es más simple de transportar).
-fn reply_for(items: [Item], id: string) -> [Item] {
+// Calcula los derivados de una versión del índice: una pasada, una vez por versión.
+fn build_index(items: [Item]) -> Index {
+    var rendered: [string] = [];
+    var by_id: Map<string, int> = Map.new();
     var i: int = 0;
     while (i < items.len()) {
-        if (items[i].id == id) {
-            return [items[i]];
-        }
+        rendered.push(library.item_json(items[i]));
+        by_id.insert(items[i].id, i);
         i = i + 1;
     }
-    []
+    Index { items: items, rendered: rendered, by_id: by_id }
+}
+
+// Devuelve el item pedido como lista de 0 o 1 elementos (un Option por canal obligaría a
+// anotar el tipo en cada sitio; la lista es más simple de transportar).
+fn reply_for(index: Index, id: string) -> [Item] {
+    match (index.by_id.get(id)) {
+        Option.Some(i) => [index.items[i]],
+        Option.None => [],
+    }
+}
+
+fn keep(it: Item, kind: string, text: string) -> bool {
+    if (kind != "" && library.kind_name(it.kind) != kind) {
+        return false;
+    }
+    library.matches(it, text)
 }
 
 fn filtered(items: [Item], kind: string, text: string) -> [Item] {
     var out: [Item] = [];
     var i: int = 0;
     while (i < items.len()) {
-        let it: Item = items[i];
+        if (keep(items[i], kind, text)) {
+            out.push(items[i]);
+        }
         i = i + 1;
-        if (kind != "" && library.kind_name(it.kind) != kind) {
-            continue;
-        }
-        if (!library.matches(it, text)) {
-            continue;
-        }
-        out.push(it);
     }
     out
+}
+
+// El array JSON de los items que pasan el filtro, unido una sola vez a partir del JSON ya
+// renderizado de cada uno. Sin filtro, ni siquiera se recorren los items.
+fn filtered_json(index: Index, kind: string, text: string) -> string {
+    if (kind == "" && text == "") {
+        return "[" + join(index.rendered, ",") + "]";
+    }
+    var parts: [string] = [];
+    var i: int = 0;
+    while (i < index.items.len()) {
+        if (keep(index.items[i], kind, text)) {
+            parts.push(index.rendered[i]);
+        }
+        i = i + 1;
+    }
+    "[" + join(parts, ",") + "]"
 }
 
 // [total, videos, audios, images, bytes]
@@ -138,8 +189,17 @@ pub fn list(st: Store, kind: string, text: string) -> [Item] {
     }
 }
 
-/// One item by id. (Named `find_by_id` and not `get`: a `pub fn get` shadows the free
-/// builtin of the same name even inside the stdlib — see NOTES-raylang.md, hallazgo 1.)
+/// The same selection as `list`, already as the JSON array the API serves.
+pub fn list_json(st: Store, kind: string, text: string) -> string {
+    let reply: Channel<string> = Channel.new();
+    send(st.inbox, Ask.ListJson(JsonQuery { kind: kind, text: text, reply: reply }));
+    match (recv(reply)) {
+        Option.Some(v) => v,
+        Option.None => "[]",
+    }
+}
+
+/// One item by id. (Named `find_by_id` rather than `get`: clearer for a catalog lookup.)
 pub fn find_by_id(st: Store, id: string) -> Option<Item> {
     let reply: Channel<[Item]> = Channel.new();
     send(st.inbox, Ask.Get(Lookup { id: id, reply: reply }));
@@ -202,5 +262,25 @@ fn the_actor_serves_queries() {
 
     replace(st, [a]);
     assert_eq(list(st, "", "").len(), 1);
+    // Tras el reemplazo, el índice por id apunta a la versión nueva.
+    match (find_by_id(st, b.id)) {
+        Option.Some(_) => panic("a replaced-away item must not resolve"),
+        Option.None => { },
+    }
+    stop(st);
+}
+
+@test
+fn list_json_matches_the_items() {
+    let a: Item = library.new_item("v/movie.mp4", Kind.Video, 10, 1);
+    var b: Item = library.new_item("m/song.mp3", Kind.Audio, 20, 2);
+    b.artist = "Bill Evans";
+    let st: Store = start([a, b]);
+
+    // El JSON renderizado de antemano es el mismo que serializar la selección ahora.
+    assert_eq(list_json(st, "", ""), library.items_json([a, b]));
+    assert_eq(list_json(st, "audio", ""), library.items_json([b]));
+    assert_eq(list_json(st, "", "evans"), library.items_json([b]));
+    assert_eq(list_json(st, "image", ""), "[]");
     stop(st);
 }

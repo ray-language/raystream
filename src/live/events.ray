@@ -206,19 +206,21 @@ fn reindex(hub: Hub, st: Store, root: string, path: string) {
     if (path.contains("/.raystream/")) {
         return;
     }
-    match (indexer.build(root)) {
+    // Incremental: la versión actual del índice dice qué ficheros no han cambiado.
+    let started: int = time.now();
+    let previous: [Item] = store.list(st, "", "");
+    match (indexer.build_incremental(root, previous)) {
         Result.Err(e) => {
             eprint("reindex: ${e}");
         },
         Result.Ok(items) => {
             store.replace(st, items);
-            let payload: string = json
-                .obj()
+            let payload: string = json.obj()
                 .field("type", "library_changed")
                 .field("items", items.len())
                 .render();
             publish(hub, payload);
-            print("library changed → ${items.len()} item(s)");
+            print("library changed → ${items.len()} item(s) in ${time.now() - started} ms");
         },
     }
 }

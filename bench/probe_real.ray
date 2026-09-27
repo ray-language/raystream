@@ -1,0 +1,98 @@
+// El probe con ficheros de tamaño REAL: el banco de escala usa ficheros diminutos y mide el
+// coste por fichero del indexador; aquí se mide lo que pesa leer las cabeceras de una
+// biblioteca de música de verdad (MP3 de varios MB con carátula embebida).
+//
+//   ray build --native bench/probe_real.ray -o /tmp/probe_real
+//   /tmp/probe_real 300 4096 300      # 300 MP3 de 4 MB con una carátula de 300 KB
+import std/fs;
+import std/time;
+import catalog/library;
+import meta/probe;
+from catalog/library import Item, Kind;
+
+fn main() -> int {
+    let argv: [string] = args();
+    let n: int = if (argv.len() > 0) { parse_int(argv[0]).unwrap_or(300) } else { 300 };
+    let size_kb: int = if (argv.len() > 1) { parse_int(argv[1]).unwrap_or(4096) } else { 4096 };
+    let cover_kb: int = if (argv.len() > 2) { parse_int(argv[2]).unwrap_or(300) } else { 300 };
+
+    let root: string = fs.make_temp_dir("raystream_probe_real").unwrap_or("/tmp");
+    let song: bytes = mp3(size_kb * 1024, cover_kb * 1024);
+    var i: int = 0;
+    while (i < n) {
+        fs.write_file_bytes("${root}/song${i}.mp3", song).unwrap_or(0);
+        i = i + 1;
+    }
+
+    // Probe de cada fichero, como el indexado en frío. Tres pasadas: la primera coincide con
+    // el volcado a disco de lo recién escrito y no es representativa; las siguientes sí.
+    print("${n} MP3 de ${size_kb} KB con carátula de ${cover_kb} KB");
+    var pass: int = 1;
+    while (pass <= 3) {
+        let t0: int = time.now();
+        var covers: int = 0;
+        var titled: int = 0;
+        var k: int = 0;
+        while (k < n) {
+            var it: Item = library.new_item("song${k}.mp3", Kind.Audio, song.len(), 0);
+            probe.probe("${root}/song${k}.mp3", it);
+            if (it.has_cover) {
+                covers = covers + 1;
+            }
+            if (it.title != "") {
+                titled = titled + 1;
+            }
+            k = k + 1;
+        }
+        let elapsed: int = time.now() - t0;
+        let per_file_us: int = if (n > 0) { elapsed * 1000 / n } else { 0 };
+        print(
+            "  pasada ${pass}: ${elapsed} ms · ${per_file_us} µs por fichero · "
+                + "${titled} con título · ${covers} con carátula"
+        );
+        pass = pass + 1;
+    }
+    fs.remove_all(root).unwrap_or(0);
+    0
+}
+
+// Un MP3 plausible: ID3v2.3 con título, artista, álbum y una carátula (APIC) del tamaño
+// pedido, una cabecera de trama MPEG-1 Layer III a 128 kbps y el resto relleno.
+fn mp3(total: int, cover: int) -> bytes {
+    var picture: [int] = [];
+    var p: int = 0;
+    while (p < cover) {
+        picture.push(p % 251);
+        p = p + 1;
+    }
+    let apic: bytes = bytes_of([0])
+        + b"image/jpeg"
+        + bytes_of([0, 3])
+        + b"front"
+        + bytes_of([0])
+        + bytes_of(picture);
+    let frames: bytes = frame("TIT2", bytes_of([0]) + b"A Real Song")
+        + frame("TPE1", bytes_of([0]) + b"Some Artist")
+        + frame("TALB", bytes_of([0]) + b"Some Album")
+        + frame("APIC", apic);
+    let n: int = frames.len();
+    let tag: bytes = b"ID3" + bytes_of(
+        [3, 0, 0, (n / 2097152) % 128, (n / 16384) % 128, (n / 128) % 128, n % 128]
+    ) + frames;
+    let head: bytes = tag + bytes_of([0xFF, 0xFB, 0x90, 0x00]);
+    var fill: [int] = [];
+    var f: int = head.len();
+    while (f < total) {
+        fill.push(0);
+        f = f + 1;
+    }
+    head + bytes_of(fill)
+}
+
+fn frame(id: string, body: bytes) -> bytes {
+    let n: int = body.len();
+    id.to_bytes()
+        + bytes_of([(n / 16777216) % 256, (n / 65536) % 256, (n / 256) % 256, n % 256])
+        + bytes_of([0, 0])
+        + body
+}

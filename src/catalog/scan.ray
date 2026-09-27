@@ -21,7 +21,29 @@ pub fn scan(root: string) -> Result<[Item], string> {
 
 // Asocia cada fichero de subtítulos con su vídeo: mismo nombre base, opcionalmente con
 // un código de idioma delante de la extensión (`movie.es.srt` → `movie.*`, idioma "es").
+//
+// Primero un índice nombre-base → items (una pasada), y luego una consulta por subtítulo.
+// La versión anterior recorría todos los items por cada subtítulo: O(subtítulos × items),
+// 3,7 s de escaneo con 20.000 ficheros (bench/library_scale.ray).
 fn attach_subtitles(items: [Item], sidecars: [string]) {
+    if (sidecars.len() == 0) {
+        return;
+    }
+    var by_stem: Map<string, [int]> = Map.new();
+    var i: int = 0;
+    while (i < items.len()) {
+        let it: Item = items[i];
+        match (it.kind) {
+            Kind.Image => { },
+            Kind.Audio => {
+                index_stem(by_stem, strip_extension(it.rel), i);
+            },
+            Kind.Video => {
+                index_stem(by_stem, strip_extension(it.rel), i);
+            },
+        }
+        i = i + 1;
+    }
     var s: int = 0;
     while (s < sidecars.len()) {
         let rel: string = sidecars[s];
@@ -33,25 +55,35 @@ fn attach_subtitles(items: [Item], sidecars: [string]) {
         let has_lang: bool = subtitles.looks_like_language(maybe_lang);
         let stem: string = if (has_lang) { strip_extension(without_ext) } else { without_ext };
         let lang: string = if (has_lang) { maybe_lang.to_lower() } else { "" };
-
-        var i: int = 0;
-        while (i < items.len()) {
-            let it: Item = items[i];
-            i = i + 1;
-            match (it.kind) {
-                Kind.Image => {
-                    continue;
-                },
-                Kind.Audio => { },
-                Kind.Video => { },
-            }
-            if (strip_extension(it.rel) != stem) {
-                continue;
-            }
-            it.tracks.push(
-                Track { rel: rel, lang: lang, label: subtitles.language_label(lang), format: ext }
-            );
+        match (by_stem.get(stem)) {
+            Option.None => { },
+            Option.Some(owners) => {
+                var k: int = 0;
+                while (k < owners.len()) {
+                    items[owners[k]].tracks.push(
+                        Track {
+                            rel: rel,
+                            lang: lang,
+                            label: subtitles.language_label(lang),
+                            format: ext
+                        }
+                    );
+                    k = k + 1;
+                }
+            },
         }
+    }
+}
+
+// Añade `index` a la lista de items que comparten nombre base (`movie.mp4` y `movie.mkv`).
+fn index_stem(by_stem: Map<string, [int]>, stem: string, index: int) {
+    match (by_stem.get(stem)) {
+        Option.Some(owners) => {
+            owners.push(index);
+        },
+        Option.None => {
+            by_stem.insert(stem, [index]);
+        },
     }
 }
 

@@ -7,7 +7,7 @@ from catalog/store import Store;
 
 /// `GET /api/library?kind=&q=` — the filtered library as a JSON array.
 pub fn library_json(st: Store, kind: string, query: string) -> string {
-    library.items_json(store.list(st, kind, query))
+    store.list_json(st, kind, query)
 }
 
 /// `GET /api/item/:id` — one item, or `None` when the id is unknown.

@@ -1,0 +1,136 @@
+// Cómo escala raystream con el tamaño de la biblioteca: genera bibliotecas sintéticas de N
+// ficheros con cabeceras reales (los parsers de `src/meta` tienen algo que leer) y mide cada
+// etapa del indexado y lo que cuesta servir el catálogo.
+//
+//   ray build --native bench/library_scale.ray -o /tmp/library_scale
+//   /tmp/library_scale 1000 5000 20000
+//
+// Mezcla: por cada 10 ficheros, 3 WAV, 3 PNG, 3 MP3 con ID3 y 1 MP4 con su subtítulo `.es.srt`.
+// Los ficheros son diminutos: se mide el coste por fichero del indexador, no el del disco.
+import std/fs;
+import std/time;
+import bench/synthetic;
+import catalog/indexer;
+import catalog/library;
+import catalog/scan;
+import catalog/store;
+from catalog/library import Item;
+from catalog/store import Store;
+
+fn main() -> int {
+    let argv: [string] = args();
+    var sizes: [int] = [];
+    var a: int = 0;
+    while (a < argv.len()) {
+        sizes.push(parse_int(argv[a]).unwrap_or(1000));
+        a = a + 1;
+    }
+    if (sizes.len() == 0) {
+        sizes = [1000, 5000];
+    }
+    // `recorrido` = sólo list_dir + stat de cada entrada (el suelo del disco).
+    // `escaneo`   = scan.scan: recorrido + construir cada Item (su id es un SHA-256) + emparejar
+    //               subtítulos. Si crece más deprisa que el recorrido, algo en él es no lineal.
+    // `frío`      = indexer.build: escaneo + probe de todo (el arranque).
+    // `reindexado`= indexer.build_incremental tras añadir un fichero (lo que hace el vigilante).
+    // `publicar`  = el actor recibe la versión nueva y renderiza el JSON de cada item.
+    // `api`       = /api/library en régimen, sin filtro y con filtro de texto.
+    print(
+        "      N  recorrido  escaneo      frío  reindexado  publicar       api  api+filtro      JSON"
+    );
+    var i: int = 0;
+    while (i < sizes.len()) {
+        measure(sizes[i]);
+        i = i + 1;
+    }
+    0
+}
+
+fn measure(n: int) {
+    let root: string = fs.make_temp_dir("raystream_scale").unwrap_or("/tmp");
+    synthetic.generate(root, n);
+
+    let t_walk: int = time.now();
+    count_entries(root, "");
+    let walk_ms: int = time.now() - t_walk;
+
+    let t1: int = time.now();
+    let scanned: [Item] = scan.scan(root).unwrap_or([]);
+    let scan_ms: int = time.now() - t1;
+
+    // El indexado en frío, como al arrancar: escaneo + probe de todo.
+    let t3: int = time.now();
+    let items: [Item] = indexer.build(root).unwrap_or([]);
+    let cold_ms: int = time.now() - t3;
+
+    // El reindexado del vigilante tras un cambio: incremental, sólo abre lo nuevo o modificado.
+    fs.write_file_bytes("${root}/d0/added.wav", synthetic.wav_file()).unwrap_or(0);
+    let t4: int = time.now();
+    let again: [Item] = indexer.build_incremental(root, items).unwrap_or([]);
+    let incr_ms: int = time.now() - t4;
+
+    // Publicar una versión: el actor renderiza el JSON de cada item una vez.
+    let st: Store = store.start([]);
+    let t5: int = time.now();
+    store.replace(st, again);
+    store.list_json(st, "", "");
+    let publish_ms: int = time.now() - t5;
+
+    // `/api/library` en régimen: sin filtro y con un filtro de texto.
+    let t6: int = time.now();
+    let body: string = store.list_json(st, "", "");
+    let api_ms: int = time.now() - t6;
+    let t7: int = time.now();
+    store.list_json(st, "audio", "song1");
+    let api_filtered_ms: int = time.now() - t7;
+    store.stop(st);
+
+    print(
+        "${pad(to_string(n), 7)} ${pad(ms(walk_ms), 10)} ${pad(ms(scan_ms), 9)} "
+            + "${pad(ms(cold_ms), 9)} ${pad(ms(incr_ms), 11)} ${pad(ms(publish_ms), 9)} "
+            + "${pad(ms(api_ms), 9)} ${pad(ms(api_filtered_ms), 10)} ${pad(kb(body.len()), 9)}"
+    );
+    fs.remove_all(root).unwrap_or(0);
+}
+
+// El recorrido puro: list_dir + stat de cada entrada, sin construir nada.
+fn count_entries(root: string, prefix: string) -> int {
+    let dir: string = if (prefix == "") { root } else { root + "/" + prefix };
+    let names: [string] = fs.list_dir(dir).unwrap_or([]);
+    var total: int = 0;
+    var i: int = 0;
+    while (i < names.len()) {
+        let name: string = names[i];
+        let rel: string = if (prefix == "") { name } else { prefix + "/" + name };
+        match (fs.stat(root + "/" + rel)) {
+            Result.Ok(st) => {
+                if (st.kind == "dir") {
+                    total = total + count_entries(root, rel);
+                } else {
+                    total = total + 1;
+                }
+            },
+            Result.Err(_) => { },
+        }
+        i = i + 1;
+    }
+    total
+}
+
+// --- Formato -------------------------------------------------------------------------------
+
+fn ms(v: int) -> string {
+    "${v} ms"
+}
+
+fn kb(v: int) -> string {
+    "${v / 1024} KB"
+}
+
+fn pad(s: string, width: int) -> string {
+    var out: string = s;
+    while (out.len() < width) {
+        out = " " + out;
+    }
+    out
+}

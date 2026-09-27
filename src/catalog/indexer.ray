@@ -1,5 +1,10 @@
-// El indexado completo: recorrer el árbol y sacarle los metadatos a cada fichero.
-// Es lo que corre al arrancar y lo que vuelve a correr cuando el vigilante ve un cambio.
+// El indexado: recorrer el árbol y sacarle los metadatos a cada fichero.
+//
+// Al arrancar se probea todo. Después, cada cambio en disco reindexa de forma INCREMENTAL:
+// el recorrido (barato: list_dir + stat) se repite entero, pero un fichero con la misma ruta,
+// el mismo tamaño y el mismo mtime que en la versión anterior conserva sus metadatos y no se
+// vuelve a abrir. Sólo se probean los ficheros nuevos o modificados.
+import std/fs;
 import std/time;
 import catalog/scan;
 import meta/probe;
@@ -8,19 +13,57 @@ from catalog/library import Item;
 /// Scans `root` and enriches every item with its metadata. Returns the items ready for
 /// the catalog actor.
 pub fn build(root: string) -> Result<[Item], string> {
+    let empty: [Item] = [];
+    build_incremental(root, empty)
+}
+
+/// Like `build`, reusing the metadata of every file that is unchanged since `previous`
+/// (same relative path, size and mtime). Only new or modified files are opened.
+pub fn build_incremental(root: string, previous: [Item]) -> Result<[Item], string> {
     let items: [Item] = scan.scan(root)?;
+    var known: Map<string, int> = Map.new();
+    var p: int = 0;
+    while (p < previous.len()) {
+        known.insert(previous[p].rel, p);
+        p = p + 1;
+    }
     var i: int = 0;
     while (i < items.len()) {
         let it: Item = items[i];
-        match (scan.safe_path(root, it.rel)) {
-            Result.Ok(path) => {
-                probe.probe(path, it);
+        let reused: bool = match (known.get(it.rel)) {
+            Option.None => false,
+            Option.Some(k) => {
+                let old: Item = previous[k];
+                if (old.size == it.size && old.mtime_ms == it.mtime_ms) {
+                    copy_metadata(old, it);
+                    true
+                } else {
+                    false
+                }
             },
-            Result.Err(_) => { },
+        };
+        if (!reused) {
+            match (scan.safe_path(root, it.rel)) {
+                Result.Ok(path) => {
+                    probe.probe(path, it);
+                },
+                Result.Err(_) => { },
+            }
         }
         i = i + 1;
     }
     Result.Ok(items)
+}
+
+// Lo que produce el probe (los subtítulos no: ésos los recalcula el escaneo cada vez).
+fn copy_metadata(from_item: Item, to_item: Item) {
+    to_item.duration_ms = from_item.duration_ms;
+    to_item.width = from_item.width;
+    to_item.height = from_item.height;
+    to_item.title = from_item.title;
+    to_item.artist = from_item.artist;
+    to_item.album = from_item.album;
+    to_item.has_cover = from_item.has_cover;
 }
 
 /// Same as `build`, reporting how long it took in milliseconds.
@@ -30,4 +73,48 @@ pub fn build_timed(root: string) -> Result<[Item], string> {
     let elapsed: int = time.now() - started;
     print("indexed ${items.len()} item(s) from ${root} in ${elapsed} ms");
     Result.Ok(items)
+}
+
+@test
+fn unchanged_files_keep_their_metadata_without_being_opened() {
+    let root: string = fs_temp();
+    std_write(root + "/a.wav", wav_bytes());
+    let first: [Item] = build(root).unwrap_or([]);
+    assert_eq(first.len(), 1);
+    assert_eq(first[0].duration_ms, 1000);
+
+    // Si la versión anterior dice otra cosa y el fichero no cambió, gana la versión anterior:
+    // prueba de que no se ha vuelto a abrir.
+    first[0].duration_ms = 4242;
+    let again: [Item] = build_incremental(root, first).unwrap_or([]);
+    assert_eq(again[0].duration_ms, 4242);
+
+    // Un fichero nuevo sí se probea.
+    std_write(root + "/b.wav", wav_bytes());
+    let third: [Item] = build_incremental(root, again).unwrap_or([]);
+    assert_eq(third.len(), 2);
+    assert_eq(third[1].duration_ms, 1000);
+    fs_cleanup(root);
+}
+
+// --- Ayudas de los tests -------------------------------------------------------------------
+
+fn fs_temp() -> string {
+    fs.make_temp_dir("raystream_indexer").unwrap_or("/tmp")
+}
+
+fn std_write(path: string, data: bytes) {
+    fs.write_file_bytes(path, data).unwrap_or(0);
+}
+
+fn fs_cleanup(root: string) {
+    fs.remove_all(root).unwrap_or(0);
+}
+
+// 44 100 Hz, mono, 16 bits, 88 200 octetos de datos: 1 000 ms exactos.
+fn wav_bytes() -> bytes {
+    var b: bytes = b"RIFF" + bytes_of([0, 0, 0, 0]) + b"WAVE" + b"fmt ";
+    b = b + bytes_of([16, 0, 0, 0, 1, 0, 1, 0]);
+    b = b + bytes_of([0x44, 0xAC, 0x00, 0x00, 0x88, 0x58, 0x01, 0x00, 2, 0, 16, 0]);
+    b + b"data" + bytes_of([0x88, 0x58, 0x01, 0x00])
 }

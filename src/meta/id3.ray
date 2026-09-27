@@ -149,43 +149,53 @@ fn utf16(b: bytes) -> string {
 // APIC: codificación, MIME terminado en 0, tipo de imagen, descripción terminada en 0, datos.
 // PIC (2.2) lleva un tipo de imagen de tres letras en lugar del MIME.
 fn picture_of(payload: bytes, short_form: bool) -> [bytes] {
-    if (payload.len() < 4) {
+    let start: int = picture_data_offset(payload, short_form);
+    if (start < 0 || start >= payload.len()) {
         return [b"", b""];
     }
-    let encoding: int = payload[0];
+    [picture_mime(payload, short_form), payload.sub_bytes(start, payload.len())]
+}
+
+/// Where the image data starts inside an APIC/PIC frame body, or -1 when `prefix` does not
+/// reach that far (or the frame is malformed). Works on the first octets of the body: the
+/// lean probe reads only this much to tell a real cover from an empty APIC frame.
+pub fn picture_data_offset(prefix: bytes, short_form: bool) -> int {
+    if (prefix.len() < 4) {
+        return 0 - 1;
+    }
+    let encoding: int = prefix[0];
     var pos: int = 1;
-    var mime: bytes = b"image/jpeg";
     if (short_form) {
-        let kind: string = utf8_or(payload.sub_bytes(1, 4), "JPG");
-        mime = if (kind.to_upper() == "PNG") { b"image/png" } else { b"image/jpeg" };
         pos = 4;
     } else {
-        let stop: int = index_of_zero(payload, pos);
+        let stop: int = index_of_zero(prefix, pos);
         if (stop < 0) {
-            return [b"", b""];
+            return 0 - 1;
         }
-        mime = payload.sub_bytes(pos, stop);
         pos = stop + 1;
     }
     // Tipo de imagen (1 octeto) y descripción terminada en 0 (doble 0 en UTF-16).
     pos = pos + 1;
-    if (encoding == 1 || encoding == 2) {
-        let stop: int = index_of_double_zero(payload, pos);
-        if (stop < 0) {
-            return [b"", b""];
-        }
-        pos = stop + 2;
+    let stop: int = if (encoding == 1 || encoding == 2) {
+        index_of_double_zero(prefix, pos)
     } else {
-        let stop: int = index_of_zero(payload, pos);
-        if (stop < 0) {
-            return [b"", b""];
-        }
-        pos = stop + 1;
+        index_of_zero(prefix, pos)
+    };
+    if (stop < 0) {
+        return 0 - 1;
     }
-    if (pos >= payload.len()) {
-        return [b"", b""];
+    if (encoding == 1 || encoding == 2) { stop + 2 } else { stop + 1 }
+}
+
+// El MIME de la carátula: explícito en APIC, un código de tres letras en PIC (2.2).
+fn picture_mime(payload: bytes, short_form: bool) -> bytes {
+    if (short_form) {
+        let kind: string = utf8_or(payload.sub_bytes(1, 4), "JPG");
+        if (kind.to_upper() == "PNG") { b"image/png" } else { b"image/jpeg" }
+    } else {
+        let stop: int = index_of_zero(payload, 1);
+        if (stop < 0) { b"image/jpeg" } else { payload.sub_bytes(1, stop) }
     }
-    [mime, payload.sub_bytes(pos, payload.len())]
 }
 
 fn index_of_zero(b: bytes, from_pos: int) -> int {
@@ -223,6 +233,88 @@ fn utf8_or(b: bytes, fallback: string) -> string {
         Result.Ok(s) => s.trim(),
         Result.Err(_) => fallback,
     }
+}
+
+// --- Lectura ligera: interpretar cabeceras sin tener la etiqueta entera en memoria ---
+//
+// El probe del indexado no necesita la carátula, sólo saber si existe, ni tampoco leer la
+// etiqueta de una vez: le basta con ir de cabecera en cabecera de marco saltando los
+// cuerpos que no le interesan. Estas funciones interpretan esos trozos sueltos; la E/S la
+// hace `meta/probe`.
+
+/// What the 10-octet ID3v2 header (plus the extended-header size, when present) says.
+pub struct Header {
+    major: int,
+    total: int,
+    first_frame: int,
+}
+
+/// A frame header: its id and the size of its body.
+pub struct FrameHeader {
+    id: string,
+    size: int,
+}
+
+/// Parses the tag header from the first 14 octets of a file (`None` when there is no
+/// ID3v2 tag). `first_frame` already skips an extended header.
+pub fn header_of(first: bytes) -> Option<Header> {
+    let total: int = tag_size(first);
+    if (total == 0) {
+        return Option.None;
+    }
+    let major: int = first[3];
+    var start: int = 10;
+    if (major >= 3 && (first[5] / 64) % 2 == 1 && first.len() >= 14) {
+        start = start + binary.be_u32(first, 10) + 4;
+    }
+    Option.Some(Header { major: major, total: total, first_frame: start })
+}
+
+/// Size of a frame header: 6 octets in ID3v2.2, 10 afterwards.
+pub fn frame_header_len(major: int) -> int {
+    if (major <= 2) { 6 } else { 10 }
+}
+
+/// Parses one frame header (exactly `frame_header_len(major)` octets).
+pub fn frame_header_of(data: bytes, major: int) -> FrameHeader {
+    let id_len: int = if (major <= 2) { 3 } else { 4 };
+    FrameHeader { id: frame_id(data, 0, id_len), size: frame_size(data, 0, major, id_len) }
+}
+
+/// Which field a frame id carries: "title", "artist", "album", "cover" or "".
+pub fn field_of(id: string) -> string {
+    if (id == "TIT2" || id == "TT2") {
+        "title"
+    } else if (id == "TPE1" || id == "TP1") {
+        "artist"
+    } else if (id == "TALB" || id == "TAL") {
+        "album"
+    } else if (id == "APIC" || id == "PIC") {
+        "cover"
+    } else {
+        ""
+    }
+}
+
+/// The text of a text frame body (the first octet is the encoding).
+pub fn text_value(payload: bytes) -> string {
+    text_of(payload)
+}
+
+/// The duration of a CBR MP3 from a window that starts where the audio starts (right after
+/// the tag): the first frame header gives the bitrate.
+pub fn duration_from(audio_head: bytes, audio_bytes: int) -> int {
+    var i: int = 0;
+    while (i + 3 < audio_head.len()) {
+        if (audio_head[i] == 0xFF && audio_head[i + 1] >= 0xE0) {
+            let kbps: int = bitrate_kbps(audio_head, i);
+            if (kbps > 0) {
+                return audio_bytes * 8 / kbps;
+            }
+        }
+        i = i + 1;
+    }
+    0
 }
 
 // --- Duración estimada de un MP3 ---

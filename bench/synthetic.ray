@@ -1,0 +1,126 @@
+// Una biblioteca sintética con cabeceras reales, para medir el indexador y el servidor a
+// escala sin depender de ficheros de nadie. Por cada 10 ficheros: 3 WAV, 3 PNG, 3 MP3 con
+// ID3 y 1 MP4 con su subtítulo `.es.srt`. Son diminutos: se mide el coste por fichero.
+import std/fs;
+
+/// Files per directory, like a real library split into albums or folders.
+pub const PER_DIR: int = 500;
+
+pub fn generate(root: string, n: int) {
+    let wav: bytes = wav_file();
+    let png: bytes = png_file();
+    let mp3: bytes = mp3_file();
+    let mp4: bytes = mp4_file();
+    var i: int = 0;
+    while (i < n) {
+        let dir: string = "${root}/d${i / PER_DIR}";
+        if (i % PER_DIR == 0) {
+            fs.mkdir(dir).unwrap_or(0);
+        }
+        let slot: int = i % 10;
+        if (slot < 3) {
+            fs.write_file_bytes("${dir}/tone${i}.wav", wav).unwrap_or(0);
+        } else if (slot < 6) {
+            fs.write_file_bytes("${dir}/pic${i}.png", png).unwrap_or(0);
+        } else if (slot < 9) {
+            fs.write_file_bytes("${dir}/song${i}.mp3", mp3).unwrap_or(0);
+        } else {
+            fs.write_file_bytes("${dir}/movie${i}.mp4", mp4).unwrap_or(0);
+            fs.write_file("${dir}/movie${i}.es.srt", "1\n00:00:01,000 --> 00:00:02,000\nHola\n")
+                .unwrap_or(0);
+        }
+        i = i + 1;
+    }
+}
+
+pub fn wav_file() -> bytes {
+    var h: [int] = [];
+    push_ascii(h, "RIFF");
+    push_u32le(h, 36 + 1024);
+    push_ascii(h, "WAVEfmt ");
+    push_u32le(h, 16);
+    push_u16le(h, 1);
+    push_u16le(h, 1);
+    push_u32le(h, 8000);
+    push_u32le(h, 16000);
+    push_u16le(h, 2);
+    push_u16le(h, 16);
+    push_ascii(h, "data");
+    push_u32le(h, 1024);
+    var i: int = 0;
+    while (i < 1024) {
+        h.push(0);
+        i = i + 1;
+    }
+    bytes_of(h)
+}
+
+pub fn png_file() -> bytes {
+    bytes_of([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        + bytes_of([0, 0, 0, 13])
+        + b"IHDR"
+        + bytes_of([0, 0, 2, 128, 0, 0, 1, 104, 8, 6, 0, 0, 0])
+        + bytes_of([0, 0, 0, 0])
+}
+
+pub fn mp3_file() -> bytes {
+    let title: bytes = bytes_of([0]) + b"Synthetic Song";
+    let artist: bytes = bytes_of([0]) + b"raystream";
+    let frames: bytes = frame("TIT2", title) + frame("TPE1", artist);
+    let n: int = frames.len();
+    let header: bytes = b"ID3" + bytes_of(
+        [3, 0, 0, (n / 2097152) % 128, (n / 16384) % 128, (n / 128) % 128, n % 128]
+    );
+    header + frames + bytes_of([0xFF, 0xFB, 0x90, 0x00]) + bytes_of([0, 0, 0, 0])
+}
+
+fn frame(id: string, body: bytes) -> bytes {
+    let n: int = body.len();
+    id.to_bytes()
+        + bytes_of([(n / 16777216) % 256, (n / 65536) % 256, (n / 256) % 256, n % 256])
+        + bytes_of([0, 0])
+        + body
+}
+
+pub fn mp4_file() -> bytes {
+    var mvhd: bytes = bytes_of([0, 0, 0, 0]) + be32(0) + be32(0) + be32(1000) + be32(60000);
+    mvhd = mvhd + be32(0x00010000) + bytes_of([1, 0, 0, 0]);
+    var tkhd: bytes = bytes_of([0, 0, 0, 3]) + be32(0) + be32(0) + be32(1) + be32(0) + be32(60000);
+    tkhd = tkhd + be32(0) + be32(0) + bytes_of([0, 0, 0, 0, 0, 0, 0, 0]);
+    var m: int = 0;
+    while (m < 9) {
+        tkhd = tkhd + be32(0);
+        m = m + 1;
+    }
+    tkhd = tkhd + be32(1280 * 65536) + be32(720 * 65536);
+    atom("ftyp", b"isom") + atom("moov", atom("mvhd", mvhd) + atom("trak", atom("tkhd", tkhd)))
+}
+
+fn atom(kind: string, body: bytes) -> bytes {
+    be32(body.len() + 8) + kind.to_bytes() + body
+}
+
+fn be32(v: int) -> bytes {
+    bytes_of([(v / 16777216) % 256, (v / 65536) % 256, (v / 256) % 256, v % 256])
+}
+
+fn push_ascii(out: [int], s: string) {
+    let b: bytes = s.to_bytes();
+    var i: int = 0;
+    while (i < b.len()) {
+        out.push(b[i]);
+        i = i + 1;
+    }
+}
+
+fn push_u16le(out: [int], v: int) {
+    out.push(v % 256);
+    out.push((v / 256) % 256);
+}
+
+fn push_u32le(out: [int], v: int) {
+    out.push(v % 256);
+    out.push((v / 256) % 256);
+    out.push((v / 65536) % 256);
+    out.push((v / 16777216) % 256);
+}

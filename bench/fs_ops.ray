@@ -1,0 +1,77 @@
+// Coste fijo de una operación de fichero en raylang: cuánto cuesta un `seek` + `read_bytes`
+// pequeño, un `open`/`close`, y cuánto una lectura grande, en un fichero ya en la caché.
+//
+//   ray build --native bench/fs_ops.ray -o /tmp/fs_ops && /tmp/fs_ops
+import std/fs;
+import std/time;
+
+const OPS: int = 20000;
+
+fn main() -> int {
+    let dir: string = fs.make_temp_dir("raystream_fsops").unwrap_or("/tmp");
+    let path: string = dir + "/f.bin";
+    var seed: [int] = [];
+    var i: int = 0;
+    while (i < 1048576) {
+        seed.push(i % 251);
+        i = i + 1;
+    }
+    fs.write_file_bytes(path, bytes_of(seed)).unwrap_or(0);
+
+    let h: int = fs.open(path, "r").unwrap_or(0 - 1);
+    // 1) seek + read de 10 octetos, en posiciones distintas.
+    let t1: int = time.now();
+    var k: int = 0;
+    while (k < OPS) {
+        fs.seek(h, (k * 4099) % 1000000).unwrap_or(0);
+        fs.read_bytes(h, 10).unwrap_or(Option.None);
+        k = k + 1;
+    }
+    let small_ms: int = time.now() - t1;
+
+    // 2) sólo seek.
+    let t2: int = time.now();
+    k = 0;
+    while (k < OPS) {
+        fs.seek(h, (k * 4099) % 1000000).unwrap_or(0);
+        k = k + 1;
+    }
+    let seek_ms: int = time.now() - t2;
+    close(h);
+
+    // 3) open + close.
+    let t3: int = time.now();
+    k = 0;
+    while (k < OPS) {
+        let hh: int = fs.open(path, "r").unwrap_or(0 - 1);
+        close(hh);
+        k = k + 1;
+    }
+    let open_ms: int = time.now() - t3;
+
+    // 4) una lectura de 256 KB (lo que hacía el probe viejo), repetida.
+    let big_ops: int = 2000;
+    let h2: int = fs.open(path, "r").unwrap_or(0 - 1);
+    let t4: int = time.now();
+    k = 0;
+    while (k < big_ops) {
+        fs.seek(h2, 0).unwrap_or(0);
+        fs.read_bytes(h2, 262144).unwrap_or(Option.None);
+        k = k + 1;
+    }
+    let big_ms: int = time.now() - t4;
+    close(h2);
+
+    print("seek + read(10 B) : ${us(small_ms, OPS)} µs por operación");
+    print("seek solo         : ${us(seek_ms, OPS)} µs por operación");
+    print("open + close      : ${us(open_ms, OPS)} µs por operación");
+    print("read(256 KB)      : ${us(big_ms, big_ops)} µs por operación");
+    fs.remove_all(dir).unwrap_or(0);
+    0
+}
+
+fn us(millis: int, ops: int) -> string {
+    let hundredths: int = millis * 100000 / ops;
+    let frac: int = hundredths % 100;
+    "${hundredths / 100}.${if (frac < 10) { "0" } else { "" }}${frac}"
+}

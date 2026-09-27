@@ -1,0 +1,127 @@
+// El servidor de extremo a extremo con una biblioteca grande: lo que nota un usuario.
+//
+//   ray run bench/gen_library.ray -- /tmp/lib20k 20000
+//   ./raystream --dir /tmp/lib20k --port 8081 &
+//   ray build --native bench/e2e_scale.ray -o /tmp/e2e && /tmp/e2e 127.0.0.1:8081 raystream /tmp/lib20k
+//
+// Mide: RSS en reposo, `/api/library` con y sin filtro, peticiones de medios (cada una busca
+// su item en el catálogo) y cuánto tarda en llegar al navegador un fichero nuevo (SSE).
+import std/fs;
+import std/json;
+import std/time;
+import net/http;
+import bench/harness;
+import bench/synthetic;
+
+fn main() -> int {
+    let argv: [string] = args();
+    if (argv.len() < 3) {
+        print("usage: e2e_scale <host:port> <process-pattern> <library-dir>");
+        return 2;
+    }
+    let origin: string = argv[0];
+    let pid: int = harness.pid_of(argv[1]).unwrap_or(0);
+    let dir: string = argv[2];
+    let base: string = "http://${origin}";
+
+    print("RSS en reposo: ${harness.mb(harness.rss_kb(pid))} MB");
+
+    let full: string = base + "/api/library";
+    let size: int = harness.drain(full).bytes_read;
+    print("/api/library            : mediana ${median_ms(full, 15)} ms · ${size / 1024} KB");
+    let filtered: string = base + "/api/library?kind=audio&q=song1";
+    print("/api/library con filtro : mediana ${median_ms(filtered, 15)} ms");
+
+    // Una petición de medios cualquiera: cada una pasa por la búsqueda del item por id.
+    let item: string = first_id(base);
+    var headers: Map<string, string> = Map.new();
+    headers.insert("Range", "bytes=0-1023");
+    let media: string = base + "/media/" + item;
+    let t0: int = time.now();
+    var k: int = 0;
+    while (k < 500) {
+        harness.drain_with(media, headers);
+        k = k + 1;
+    }
+    let range_ms: int = time.now() - t0;
+    print("500 Range sobre /media  : ${range_ms} ms · ${500000 / at_least_one(range_ms)} req/s");
+
+    print("fichero nuevo → SSE     : ${reindex_ms(base, dir)} ms");
+    print("RSS al final: ${harness.mb(harness.rss_kb(pid))} MB");
+    0
+}
+
+fn median_ms(url: string, times: int) -> int {
+    var samples: [int] = [];
+    var i: int = 0;
+    while (i < times) {
+        let t: int = time.now();
+        harness.drain(url);
+        samples.push(time.now() - t);
+        i = i + 1;
+    }
+    harness.median(samples)
+}
+
+fn first_id(base: string) -> string {
+    match (http.fetch(base + "/api/library?kind=audio&q=song1")) {
+        Result.Err(_) => "",
+        Result.Ok(resp) => {
+            match (json.parse(from_utf8(resp.body).unwrap_or("[]"))) {
+                Result.Err(_) => "",
+                Result.Ok(j) => {
+                    match (json.at(j, 0)) {
+                        Option.Some(first) => json.get_string(first, "id").unwrap_or(""),
+                        Option.None => "",
+                    }
+                },
+            }
+        },
+    }
+}
+
+// Se suscribe a /events, añade un fichero a la biblioteca y cronometra hasta que llega el
+// `library_changed`: vigilante + coalescencia + reindexado + publicación + SSE.
+fn reindex_ms(base: string, dir: string) -> int {
+    let headers: Map<string, string> = Map.new();
+    match (http.stream_with("GET", base + "/events", b"", headers, 30000)) {
+        Result.Err(e) => {
+            print("  (no se pudo abrir /events: ${e})");
+            0 - 1
+        },
+        Result.Ok(s) => {
+            // Primero llega el `hello`: la suscripción está hecha.
+            http.stream_read(s);
+            let started: int = time.now();
+            fs.write_file_bytes("${dir}/d0/e2e-${started}.wav", synthetic.wav_file()).unwrap_or(0);
+            var waited: int = 0 - 1;
+            var go: bool = true;
+            while (go) {
+                match (http.stream_read(s)) {
+                    Result.Err(_) => {
+                        go = false;
+                    },
+                    Result.Ok(piece) => {
+                        match (piece) {
+                            Option.None => {
+                                go = false;
+                            },
+                            Option.Some(chunk) => {
+                                if (from_utf8(chunk).unwrap_or("").contains("library_changed")) {
+                                    waited = time.now() - started;
+                                    go = false;
+                                }
+                            },
+                        }
+                    },
+                }
+            }
+            http.stream_close(s);
+            waited
+        },
+    }
+}
+
+fn at_least_one(v: int) -> int {
+    if (v < 1) { 1 } else { v }
+}

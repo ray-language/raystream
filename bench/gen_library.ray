@@ -1,0 +1,20 @@
+// Genera una biblioteca sintética en disco y la deja ahí, para arrancar el servidor contra
+// ella y medirlo de extremo a extremo.
+//
+//   ray run bench/gen_library.ray -- /tmp/lib20k 20000
+import std/fs;
+import bench/synthetic;
+
+fn main() -> int {
+    let argv: [string] = args();
+    if (argv.len() < 2) {
+        print("usage: gen_library <dir> <files>");
+        return 2;
+    }
+    let dir: string = argv[0];
+    let n: int = parse_int(argv[1]).unwrap_or(1000);
+    fs.mkdir(dir).unwrap_or(0);
+    synthetic.generate(dir, n);
+    print("${n} ficheros (+ ${n / 10} subtítulos) en ${dir}");
+    0
+}

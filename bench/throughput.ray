@@ -35,6 +35,9 @@ fn main() -> int {
     run_parallel(media, pid, 4);
     run_parallel(media, pid, 16);
     run_parallel(media, pid, 32);
+    // 64 y 128: el límite de conexiones simultáneas del servidor es 128.
+    run_parallel(media, pid, 64);
+    run_parallel(media, pid, 128);
 
     print("");
     print("B) peticiones pequeñas con Range (lo que hace un reproductor al saltar)");

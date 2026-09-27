@@ -5,9 +5,11 @@ audio e imágenes y los sirve por HTTP con seek real, biblioteca viva y reproduc
 entre varios navegadores. Sin ffmpeg ni ningún otro binario externo.
 
 El proyecto es también un banco de pruebas del lenguaje: todo lo que roza o falta se anota en
-[NOTES-raylang.md](NOTES-raylang.md) — 23 hallazgos hasta ahora, 19 ya resueltos aguas arriba.
+[NOTES-raylang.md](NOTES-raylang.md) — 23 hallazgos; `findings/check.ray` los reverifica todos contra
+la versión instalada (en 1.27.16: 18 resueltos, ninguno abierto ni en regresión, 5 por decisión o
+medición).
 
-Probado con **raylang 1.27.4** y el paquete **net 0.3.3**.
+Probado con **raylang 1.27.16** y el paquete **net 0.4.1**.
 
 ## Arrancar
 
@@ -28,8 +30,8 @@ reiniciar.
 
 - **Streaming con `Range`**: `200`, `206` con `Content-Range` exacto, `416`, `ETag`/`304` e
   `If-Range`, leyendo del disco por trozos — la memoria no depende del tamaño del fichero y el
-  `<video>` del navegador salta por la barra sin recargar. Medido: **9,1 GB/s agregados con 32
-  descargas simultáneas y 26 MB de RSS** (ver [bench/](bench/README.md)). Lo sirve
+  `<video>` del navegador salta por la barra sin recargar. Medido: **10,3 GB/s agregados con 32
+  descargas simultáneas y 21 MB de RSS, y 9,6 GB/s con 128** (ver [bench/](bench/README.md)). Lo sirve
   `webserver.serve_file`; lo único que pone este proyecto es el `Content-Type` del índice, porque el
   `mime_of` del paquete no conoce `.mov`, `.mkv`, `.m4a`, `.flac` ni `.ogg`.
 - **Catálogo con metadatos**, todos parseados en raylang: duración y dimensiones de MP4
@@ -39,6 +41,10 @@ reiniciar.
   los audios con carátula embebida la sirven como miniatura.
 - **Biblioteca viva**: un vigilante sobre eventos del kernel (`fs.watch`) reindexa al vuelo y empuja
   el cambio a los navegadores por Server-Sent Events. Copias un fichero en la biblioteca y aparece.
+  El reindexado es incremental: sólo se abren los ficheros nuevos o modificados.
+- **Escala**: con una biblioteca de 20.000 ficheros arranca en ~1 s, `/api/library` responde en 3 ms
+  (el JSON de cada item se renderiza una vez por versión del índice, no por petición) y un fichero
+  nuevo aparece en el navegador en ~0,6 s.
 - **Salas sincronizadas**: varios clientes en la misma sala comparten qué se reproduce, dónde y si
   está en marcha, por WebSocket.
 - **Subtítulos**: ficheros hermanos `.srt` y `.vtt` junto al medio (`demo.mov` + `demo.es.srt`), con
@@ -90,14 +96,15 @@ actores y se habla con ellos por canales:
 | `src/main.ray` | arranque, cableado y despacho de rutas |
 | `src/config.ray` | argumentos y valores por defecto |
 | `src/router.ray` | ruta → `Route` tipada, query string |
-| `src/catalog/` | `scan` (árbol y rutas seguras), `library` (modelo y JSON), `indexer` (escaneo + metadatos), `store` (el actor) |
+| `src/catalog/` | `scan` (árbol y rutas seguras), `library` (modelo y JSON), `indexer` (escaneo + metadatos, incremental), `store` (el actor, con índice por id y JSON prerenderizado) |
 | `src/meta/` | `binary`, `id3`, `mp4`, `wav`, `imagemeta`, `probe` |
 | `src/http/` | `serve_media` (MIME del índice y log sobre `webserver.serve_file`), `api` (JSON) |
 | `src/live/` | `events` (SSE + vigilante), `room` (salas WebSocket) |
 | `src/subtitles.ray` | descubrimiento de pistas y conversión SRT → WebVTT |
 | `src/thumbs.ray` | reescalado PNG y caché |
 | `src/samples.ray` | contenido de muestra |
-| `bench/` | el banco de pruebas, también en raylang: caudal, clientes lentos, A/B de escritores, coste de una miniatura y descomposición de memoria |
+| `bench/` | el banco de pruebas, también en raylang: caudal y concurrencia, escala de la biblioteca, clientes lentos, probe con ficheros reales, A/B de escritores y descomposición de memoria |
+| `findings/` | un repro mínimo por hallazgo y `check.ray`, que los reverifica todos contra el raylang instalado |
 | `spikes/` | experimentos sueltos que respaldan los hallazgos |
 
 ## Binario nativo
@@ -107,13 +114,14 @@ ray build --native -o raystream        # binario autónomo, con los assets horne
 ./raystream --dir ~/Movies --port 8080
 ```
 
-Merece la pena para cualquier uso real: la misma miniatura (PNG de 480×480) tarda **700 ms** en la
-VM y **19 ms** en el binario nativo, y 0,4 ms si ya está cacheada.
+Merece la pena para cualquier uso real: la misma miniatura (PNG de 480×480) tarda **691 ms** en la
+VM y **32 ms** en el binario nativo, y 0,4 ms si ya está cacheada.
 
 ## Tests
 
 ```sh
-ray test                        # la suite completa (48)
+ray test                        # la suite completa (52)
+ray run findings/check.ray      # los 23 hallazgos contra el raylang instalado
 ray test src/meta/id3.ray       # un módulo
 ```
 

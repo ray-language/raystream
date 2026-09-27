@@ -64,8 +64,7 @@ fn main() -> int {
     let filter_ms: int = time.now() - t_f;
 
     let t_enc: int = time.now();
-    let out_png: bytes = image
-        .encode_png(image.Image { width: TARGET, height: TARGET, pixels: small })
+    let out_png: bytes = image.encode_png(image.Image { width: TARGET, height: TARGET, pixels: small })
         .unwrap_or(b"");
     let enc_ms: int = time.now() - t_enc;
 
