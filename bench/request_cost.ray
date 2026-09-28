@@ -1,0 +1,40 @@
+// El coste fijo de una petición pequeña, para medir lo que añade cada capa del servidor
+// (enrutado, política de seguridad, cabeceras): N peticiones secuenciales a una URL, en R
+// rondas, y la mediana de los microsegundos por petición.
+//
+//   ray build --native bench/request_cost.ray -o /tmp/request_cost
+//   /tmp/request_cost http://127.0.0.1:8080/api/stats 2000 5
+import std/time;
+import bench/harness;
+
+fn main() -> int {
+    let argv: [string] = args();
+    let url: string = if (argv.len() > 0) { argv[0] } else { "http://127.0.0.1:8080/api/stats" };
+    let n: int = if (argv.len() > 1) { parse_int(argv[1]).unwrap_or(2000) } else { 2000 };
+    let rounds: int = if (argv.len() > 2) { parse_int(argv[2]).unwrap_or(5) } else { 5 };
+    var per_round: [int] = [];
+    var r: int = 0;
+    while (r < rounds) {
+        let t0: int = time.now();
+        var i: int = 0;
+        while (i < n) {
+            harness.drain(url);
+            i = i + 1;
+        }
+        per_round.push((time.now() - t0) * 1000 / n);
+        r = r + 1;
+    }
+    let med: int = harness.median(per_round);
+    print("${url}: mediana ${med} µs por petición (${1000000 / med} req/s) · rondas: ${us_list(per_round)}");
+    0
+}
+
+fn us_list(v: [int]) -> string {
+    var parts: [string] = [];
+    var i: int = 0;
+    while (i < v.len()) {
+        parts.push(to_string(v[i]));
+        i = i + 1;
+    }
+    join(parts, " ")
+}

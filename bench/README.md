@@ -7,6 +7,7 @@ desde Python destapó el hallazgo 21 y corrigió dos conclusiones — ver al fin
 |---|---|
 | `harness.ray` | lo común: descargar descartando el cuerpo, N descargas en paralelo, muestrear el RSS de otro proceso con `ps`, medianas y formato |
 | `throughput.ray` | caudal y concurrencia contra un servidor en marcha: descargas completas (1 a 128 clientes), `Range` pequeños, coste por petición y API JSON |
+| `request_cost.ray` | el coste fijo de una petición: N secuenciales a una URL en R rondas, mediana en µs (para medir lo que añade cada capa) |
 | `slow_clients.ray` | 24 clientes leyendo a ~80 KB/s: la memoria no crece y un cliente normal sigue atendido |
 | `library_scale.ray` | cómo escala el indexado con el tamaño de la biblioteca (1.000 a 20.000 ficheros), etapa por etapa |
 | `e2e_scale.ray` | el servidor real con una biblioteca grande: arranque, `/api/library`, medios y reindexado hasta el navegador |
@@ -33,6 +34,9 @@ ID=$(curl -s "localhost:8080/api/library?kind=video" \
 ray build --native bench/throughput.ray   -o /tmp/b_throughput && /tmp/b_throughput $ID 127.0.0.1:8080 raystream
 ray build --native bench/slow_clients.ray -o /tmp/b_slow       && /tmp/b_slow       $ID 127.0.0.1:8080 raystream
 rm media/video/bench.mp4
+
+# Coste fijo por petición (cualquier URL del servidor)
+ray build --native bench/request_cost.ray -o /tmp/b_cost && /tmp/b_cost http://127.0.0.1:8080/api/stats 2000 5
 
 # Escala de la biblioteca: el indexador por dentro, y el servidor por fuera
 ray build --native bench/library_scale.ray -o /tmp/b_scale && /tmp/b_scale 1000 5000 20000
@@ -72,7 +76,7 @@ Mac mini M4 (Mac16,10), loopback, binario nativo, 2026-09-27.
 | `Range` pequeño, 16 en paralelo | 16.000 req/s |
 | `Range` pequeño, 64 en paralelo | 23.272 req/s |
 | `/api/library` (biblioteca de muestra) | 0,06 ms · 15.789 req/s |
-| 24 clientes lentos (`slow_clients.ray`) | RSS +3,3 MB · `/api/stats` en 1 ms · `Range` de 64 KB en 1 ms |
+| 24 clientes lentos (`slow_clients.ray`) | RSS +3,3 MB (+9 MB el 2026-09-28, igual en las dos versiones del A/B de abajo) · `/api/stats` en 1 ms · `Range` de 64 KB en 1 ms |
 
 La concurrencia escala limpia hasta el límite: el agregado apenas cae y el reparto es equitativo;
 con 128 descargas simultáneas el servidor ocupa 30 MB (~110 KB por conexión).
@@ -162,6 +166,32 @@ Baratas: leer por trozos pequeños con `seek` no penaliza en raylang.
 | El mismo trozo cruzando un canal | 480 KB — 1,8× (hallazgo 19, sin cambios) |
 | Miniatura PNG 480×480: VM (`pixel_loop.ray`) | 691 ms (`decode_png` 483 ms) |
 | Miniatura PNG 480×480: nativo | 32 ms (hallazgo 10, en revisión) |
+
+### Tras la revisión de seguridad (A/B, 2026-09-28)
+
+`e484adf` (antes) contra `5522e40` (con la política de `Host`/`Origin`, las cabeceras de `harden`
+en cada respuesta, los topes de SSE y salas, y las carátulas servidas como rango). Mismo
+toolchain, binarios nativos compilados a la vez, ejecuciones alternadas.
+
+| Prueba | Antes | Después |
+|---|---|---|
+| Caudal, 32 clientes | 10.101–10.449 MB/s | 10.266–10.357 MB/s |
+| Caudal, 128 clientes | 9.655–9.820 MB/s | 9.509–9.537 MB/s |
+| `Range` pequeño, 1 / 16 / 64 en paralelo | 7.111 / 16.000–17.066 / 21.333–23.272 req/s | igual |
+| 24 clientes lentos: RSS en vuelo | 22,4 MB | 22,8 MB |
+| `/api/stats` (`request_cost.ray`) | 66–68 µs | 71–73 µs |
+| `/api/library`, biblioteca de muestra | 65 µs | 70–73 µs |
+| `/media` de 700 KB | 239–242 µs | 241–242 µs |
+| `/thumb` PNG cacheado (1,8 KB) | 98 µs | 107 µs |
+| `/thumb` carátula de 512 KB dentro de un MP3 | 262–266 µs · RSS 23,5 MB | **204–210 µs · RSS 12,5 MB** |
+| Biblioteca de 20.000: arranque | 952–1.011 ms | 926–955 ms |
+| Biblioteca de 20.000: `/api/library`, 500 `Range`, fichero nuevo → SSE | 3 ms · 7.352 req/s · 585 ms | 3 ms · 7.352 req/s · 583 ms |
+
+La capa de seguridad cuesta **5–7 µs por petición pequeña** (~8%: comprobar `Host` y `Origin` y
+añadir cinco cabeceras, la CSP construida por petición); en medios no se nota. La miniatura PNG
+suma además ~4 µs por pasar por `serve_file` (ETag y `stat`) en vez de leer el fichero cacheado.
+La carátula embebida mejora: se sirve como rango del disco en lugar de copiar la etiqueta ID3
+entera, un 22% más rápida y con la mitad de memoria.
 
 ## Historia
 
