@@ -8,3 +8,6 @@ media/
 raystream
 *.json.prof
 *.log
+
+# herramientas locales de prueba de seguridad: no se publican (ver SECURITY.md)
+security/

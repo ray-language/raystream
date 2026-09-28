@@ -187,8 +187,9 @@ pub fn picture_data_offset(prefix: bytes, short_form: bool) -> int {
     if (encoding == 1 || encoding == 2) { stop + 2 } else { stop + 1 }
 }
 
-// El MIME de la carátula: explícito en APIC, un código de tres letras en PIC (2.2).
-fn picture_mime(payload: bytes, short_form: bool) -> bytes {
+/// The cover's MIME type as the frame declares it: explicit in APIC, a three-letter code in
+/// PIC (ID3v2.2). It comes from the file: validate it before it reaches a header.
+pub fn picture_mime(payload: bytes, short_form: bool) -> bytes {
     if (short_form) {
         let kind: string = utf8_or(payload.sub_bytes(1, 4), "JPG");
         if (kind.to_upper() == "PNG") { b"image/png" } else { b"image/jpeg" }

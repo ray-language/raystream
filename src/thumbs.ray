@@ -1,85 +1,141 @@
-// Miniaturas. Para PNG se redimensiona de verdad (filtro de caja sobre RGBA) y el
-// resultado se cachea en disco; para audio con carátula embebida se sirve la carátula.
+// Miniaturas, sin que ningún fichero pase ENTERO por la memoria:
+//   - PNG: se reescala de verdad (filtro de caja sobre RGBA) y se cachea en disco; lo que se
+//     sirve es el fichero cacheado. Sólo se decodifican PNG de hasta MAX_PNG_DECODE octetos.
+//   - Audio con carátula embebida: la carátula es un RANGO del propio fichero; se localiza
+//     leyendo cabeceras ID3 y se sirve ese tramo desde el disco.
+//   - Cualquier otra imagen (y un PNG demasiado grande): el original, en streaming.
 //
-// Los JPEG se sirven tal cual: `std/image` sólo decodifica PNG (NOTES-raylang.md,
-// hallazgo 8), así que no hay forma de reescalarlos sin escribir un decodificador JPEG.
+// La versión anterior leía el original entero (un GIF de 64 MB, seis veces a la vez, eran
+// +1,1 GB de RSS) y copiaba la etiqueta ID3 completa para sacar la carátula (+1,3 GB). Ver
+// SECURITY.md.
+//
+// Los JPEG no se reescalan: `std/image` sólo decodifica PNG (NOTES-raylang.md, hallazgo 9).
 import std/fs;
 import std/image;
 import catalog/library;
 import meta/probe;
+import net/webserver;
 from catalog/library import Item, Kind;
 
 /// The longest side of a generated thumbnail, in pixels.
 pub const MAX_SIDE: int = 400;
 
+/// Largest PNG decoded to make a thumbnail; bigger ones are served as they are.
+pub const MAX_PNG_DECODE: int = 8388608;
+
 /// Where thumbnails are cached, relative to the library root.
 pub const CACHE_SUBDIR: string = ".raystream/thumbs";
 
-/// Returns `[mime, data]` for an item's thumbnail, or `None` when it has none (video,
-/// audio without cover art). PNGs are downscaled and cached; other images are returned
-/// untouched.
-pub fn thumbnail(root: string, path: string, it: Item) -> Option<[bytes]> {
+/// What to send as an item's thumbnail.
+pub enum Thumb {
+    // No hay miniatura (vídeo, audio sin carátula).
+    Missing,
+    // Un fichero entero: la miniatura cacheada o el original. (ruta, MIME)
+    File(string, string),
+    // Un tramo de un fichero: la carátula dentro de un MP3. (ruta, desde, hasta incl., MIME)
+    Range(string, int, int, string),
+}
+
+/// Decides an item's thumbnail. Generates (and caches) the PNG one when needed.
+pub fn thumbnail(root: string, path: string, it: Item) -> Thumb {
     match (it.kind) {
-        Kind.Video => Option.None,
-        Kind.Audio => cover(path),
+        Kind.Video => Thumb.Missing,
+        Kind.Audio => {
+            match (probe.cover_range(path)) {
+                Option.Some(c) => Thumb.Range(path, c.from_byte, c.to_byte, c.mime),
+                Option.None => Thumb.Missing,
+            }
+        },
         Kind.Image => image_thumb(root, path, it),
     }
 }
 
-fn cover(path: string) -> Option<[bytes]> {
-    let found: [bytes] = probe.cover_of(path);
-    if (found[1].len() == 0) {
-        Option.None
-    } else {
-        Option.Some(found)
+fn image_thumb(root: string, path: string, it: Item) -> Thumb {
+    if (library.extension_of(it.rel) != "png" || it.size > MAX_PNG_DECODE) {
+        // Sin decodificador para el formato, o demasiado grande: el original, en streaming.
+        return Thumb.File(path, it.mime);
     }
+    let cached: string = png_thumb(root, path, it);
+    if (cached == "") { Thumb.File(path, it.mime) } else { Thumb.File(cached, "image/png") }
 }
 
-fn image_thumb(root: string, path: string, it: Item) -> Option<[bytes]> {
-    if (library.extension_of(it.rel) != "png") {
-        // Sin decodificador JPEG/WebP/GIF: el original es la miniatura.
-        match (fs.read_file_bytes(path)) {
-            Result.Ok(data) => Option.Some([it.mime.to_bytes(), data]),
-            Result.Err(_) => Option.None,
+/// A response whose body is `[from_byte, to_byte]` of `file`, read from disk in 64 KB pieces
+/// (bounded memory, whatever the size). The package keeps its file-range responses private,
+/// so the range is produced here over a sized stream.
+pub fn range_response(
+    file: string,
+    from_byte: int,
+    to_byte: int,
+    mime: string
+) -> webserver.Response {
+    let length: int = to_byte - from_byte + 1;
+    let ch: Channel<bytes> = Channel.bounded(1);
+    spawn(fn() {
+        match (fs.open(file, "r")) {
+            Result.Err(_) => { },
+            Result.Ok(h) => {
+                fs.seek(h, from_byte).unwrap_or(0);
+                var left: int = length;
+                var go: bool = true;
+                while (go && left > 0) {
+                    let want: int = if (left < 65536) { left } else { 65536 };
+                    match (fs.read_bytes(h, want)) {
+                        Result.Ok(piece) => {
+                            match (piece) {
+                                Option.Some(chunk) => {
+                                    if (chunk.len() == 0) {
+                                        go = false;
+                                    } else {
+                                        send(ch, chunk);
+                                        left = left - chunk.len();
+                                    }
+                                },
+                                Option.None => {
+                                    go = false;
+                                },
+                            }
+                        },
+                        Result.Err(_) => {
+                            go = false;
+                        },
+                    }
+                }
+                close(h);
+            },
         }
-    } else {
-        Option.Some([b"image/png", png_thumb(root, path, it)])
-    }
+        close(ch);
+    });
+    let r: webserver.Response = webserver.stream_response_len(200, ch, length);
+    r.headers.insert("Content-Type", mime);
+    r
 }
 
-// Devuelve la miniatura PNG cacheada, generándola la primera vez. Si algo falla en el
-// camino, el original sirve igual: una miniatura nunca debe romper la galería.
-fn png_thumb(root: string, path: string, it: Item) -> bytes {
+// La ruta de la miniatura PNG cacheada, generándola la primera vez ("" si no se pudo: el
+// llamador sirve entonces el original). Una miniatura nunca debe romper la galería.
+fn png_thumb(root: string, path: string, it: Item) -> string {
     let cache_dir: string = root + "/" + CACHE_SUBDIR;
     let cached: string = "${cache_dir}/${it.id}-${it.mtime_ms}.png";
-    match (fs.read_file_bytes(cached)) {
-        Result.Ok(data) => {
-            return data;
-        },
-        Result.Err(_) => { },
+    if (fs.exists(cached)) {
+        return cached;
     }
     let original: bytes = match (fs.read_file_bytes(path)) {
         Result.Ok(data) => data,
         Result.Err(_) => b"",
     };
-    if (original.len() == 0) {
-        return original;
+    if (original.len() == 0 || original.len() > MAX_PNG_DECODE) {
+        return "";
     }
     match (image.decode_png(original)) {
-        Result.Err(_) => original,
+        Result.Err(_) => "",
         Result.Ok(img) => {
-            let small: image.Image = downscale(img, MAX_SIDE);
-            match (image.encode_png(small)) {
-                Result.Err(_) => original,
+            match (image.encode_png(downscale(img, MAX_SIDE))) {
+                Result.Err(_) => "",
                 Result.Ok(encoded) => {
-                    // La caché es best-effort: si el disco falla, se sirve igualmente.
-                    match (fs.mkdir(cache_dir)) {
-                        Result.Ok(_) => {
-                            fs.write_file_bytes(cached, encoded).unwrap_or(0);
-                        },
-                        Result.Err(_) => { },
+                    fs.mkdir(cache_dir).unwrap_or(0);
+                    match (fs.write_file_bytes(cached, encoded)) {
+                        Result.Ok(_) => cached,
+                        Result.Err(_) => "",
                     }
-                    encoded
                 },
             }
         },
@@ -175,22 +231,39 @@ fn thumbnails_are_cached_on_disk() {
     fs.write_file_bytes(root + "/big.png", png).unwrap_or(0);
     var it: Item = library.new_item("big.png", Kind.Image, png.len(), 7);
 
+    let cached: string = "${root}/${CACHE_SUBDIR}/${it.id}-7.png";
     match (thumbnail(root, root + "/big.png", it)) {
-        Option.Some(first) => {
-            assert_eq(first[0], b"image/png");
-            let decoded: image.Image = image.decode_png(first[1]).unwrap_or(solid(1, 1, 0, 0, 0));
+        Thumb.File(file, mime) => {
+            assert_eq(file, cached);
+            assert_eq(mime, "image/png");
+            let decoded: image.Image = image.decode_png(fs.read_file_bytes(file).unwrap_or(b""))
+                .unwrap_or(solid(1, 1, 0, 0, 0));
             assert_eq(decoded.width, MAX_SIDE);
-            // La segunda vez sale de la caché: el fichero existe y el contenido coincide.
-            let cached: string = "${root}/${CACHE_SUBDIR}/${it.id}-7.png";
-            assert(fs.exists(cached));
-            match (thumbnail(root, root + "/big.png", it)) {
-                Option.Some(second) => assert_eq(second[1], first[1]),
-                Option.None => panic("cached thumbnail disappeared"),
-            }
         },
-        Option.None => panic("a png should have a thumbnail"),
+        Thumb.Range(_, _, _, _) => panic("a png is not a range"),
+        Thumb.Missing => panic("a png should have a thumbnail"),
     }
     fs.remove_all(root).unwrap_or(0);
+}
+
+@test
+fn big_or_undecodable_images_are_served_as_they_are() {
+    // Un PNG por encima del tope no se decodifica: se sirve el original, sin cargarlo.
+    var big: Item = library.new_item("huge.png", Kind.Image, MAX_PNG_DECODE + 1, 1);
+    match (thumbnail("/nonexistent", "/lib/huge.png", big)) {
+        Thumb.File(file, _) => assert_eq(file, "/lib/huge.png"),
+        Thumb.Range(_, _, _, _) => panic("no range for an image"),
+        Thumb.Missing => panic("the original is the thumbnail"),
+    }
+    let gif: Item = library.new_item("anim.gif", Kind.Image, 10, 1);
+    match (thumbnail("/nonexistent", "/lib/anim.gif", gif)) {
+        Thumb.File(file, mime) => {
+            assert_eq(file, "/lib/anim.gif");
+            assert_eq(mime, "image/gif");
+        },
+        Thumb.Range(_, _, _, _) => panic("no range for an image"),
+        Thumb.Missing => panic("the original is the thumbnail"),
+    }
 }
 
 fn solid(w: int, h: int, r: int, g: int, b: int) -> image.Image {

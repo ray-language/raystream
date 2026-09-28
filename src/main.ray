@@ -1,12 +1,11 @@
 // raystream — un servidor de medios personal escrito en raylang.
 //
-// Un único puerto sobre `webserver.serve_raw`: la conexión cruda es lo que permite
-// escribir un 206 con Content-Length exacto (streaming de vídeo con seek), abrir un
-// stream SSE y hacer el upgrade a WebSocket. El enrutado y el catálogo son nuestros.
+// Un único puerto sobre `webserver.serve_raw_limits`: la conexión cruda es lo que permite
+// abrir un stream SSE y hacer el upgrade a WebSocket; los ficheros los sirve el paquete.
+// El enrutado, el catálogo y la política de seguridad (src/security.ray) son nuestros.
 //
 // Fibras: una por conexión, más el actor del catálogo, el hub de eventos, el vigilante
 // del directorio y el actor de salas. Ninguna comparte memoria: todo por canales.
-import std/net;
 import catalog/indexer;
 import catalog/library;
 import catalog/scan;
@@ -19,6 +18,7 @@ import live/room;
 import net/webserver;
 import router;
 import samples;
+import security;
 import subtitles;
 import thumbs;
 from catalog/library import Item, Track;
@@ -27,13 +27,18 @@ from config import Config;
 from live/events import Hub;
 from live/room import Rooms;
 from router import Route;
+from security import Policy;
+from thumbs import Thumb;
 
 /// Connections served at once; beyond this the accept loop parks and the kernel's
-/// backlog holds the rest. Long-lived connections (SSE, rooms) occupy a slot each.
+/// backlog holds the rest. Long-lived connections (SSE, rooms) have their own caps below it.
 const MAX_CONNS: int = 128;
 
 /// How long a client has to send its request line and headers.
 const REQUEST_TIMEOUT_MS: int = 15000;
+
+/// Longest free-text query accepted by /api/library.
+const MAX_QUERY: int = 200;
 
 fn main() -> int {
     match (config.parse(args())) {
@@ -70,18 +75,35 @@ fn boot(cfg: Config) -> Result<int, string> {
     let hub: Hub = events.start();
     let rooms: Rooms = room.start();
     events.watch_library(hub, st, root);
+    let policy: Policy = security.policy_for(cfg);
 
-    // `serve_raw_with` da el bucle de accept, los límites y el cierre de la conexión; el
-    // handler va escrito INLINE en la llamada, que es la forma que también compila a
-    // binario nativo (NOTES-raylang.md, hallazgo 5: un closure guardado en una variable
-    // no cruza a las fibras de conexión).
+    // `serve_raw_limits` da el bucle de accept, los límites y el cierre de la conexión. En modo
+    // red local, además, exige el token antes de llegar al manejador (`Limits.local_token`).
+    // El handler va escrito INLINE en la llamada, la forma que también compila a nativo.
     let limits: webserver.Limits = webserver.default_limits();
     limits.max_conns = MAX_CONNS;
     limits.read_timeout_millis = REQUEST_TIMEOUT_MS;
-    print("raystream listening on http://${cfg.host}:${cfg.port}  (library: ${root})");
+    limits.local_token = policy.token;
+    announce(cfg, policy, root);
     webserver.serve_raw_limits(cfg.host, cfg.port, limits, fn(req: webserver.Request, conn: int) {
-        dispatch(st, hub, rooms, root, req, conn);
+        dispatch(st, hub, rooms, root, policy, req, conn);
     })
+}
+
+fn announce(cfg: Config, policy: Policy, root: string) {
+    print("raystream listening on http://${cfg.host}:${cfg.port}  (library: ${root})");
+    if (!config.is_loopback(cfg.host)) {
+        print("");
+        print("LAN mode: every device on the network can reach this port, so every request");
+        print("needs the access token. Open this URL once on each device (it keeps a cookie):");
+        print("  http://<this machine's address>:${cfg.port}/?ray_token=${policy.token}");
+        print("The traffic is not encrypted: use it on networks you trust (see SECURITY.md).");
+        print("");
+    } else if (security.requires_token(policy)) {
+        print(
+            "Access token required. Open: http://${cfg.host}:${cfg.port}/?ray_token=${policy.token}"
+        );
+    }
 }
 
 fn print_summary(items: [Item]) {
@@ -100,79 +122,107 @@ fn print_summary(items: [Item]) {
     }
 }
 
+// Lo que necesita cada respuesta para salir: la petición (para el HEAD y el Host), la
+// conexión y, en modo red local, la cookie del token que haya que sembrar.
+struct Out {
+    req: webserver.Request,
+    conn: int,
+    cookie: string,
+}
+
 // El despachador: una ruta tipada y su respuesta. Cada conexión corre en su propia fibra.
-fn dispatch(st: Store, hub: Hub, rooms: Rooms, root: string, req: webserver.Request, conn: int) {
-    let is_head: bool = req.method == "HEAD";
-    if (req.method != "GET" && !is_head) {
-        send_simple(req, conn, webserver.text(405, "method not allowed\n"));
+fn dispatch(
+    st: Store,
+    hub: Hub,
+    rooms: Rooms,
+    root: string,
+    policy: Policy,
+    req: webserver.Request,
+    conn: int
+) {
+    let out: Out = Out { req: req, conn: conn, cookie: security.token_cookie_for(req, policy) };
+    match (security.refuse(req, policy)) {
+        Option.Some(refusal) => {
+            emit(out, refusal);
+            return;
+        },
+        Option.None => { },
+    }
+    if (req.method != "GET" && req.method != "HEAD") {
+        emit(out, webserver.text(405, "method not allowed\n"));
         return;
     }
     match (router.resolve(req.path)) {
         Route.Home => {
-            send_asset(conn, "index.html", req);
+            send_asset(out, "index.html");
         },
         Route.Asset(name) => {
-            send_asset(conn, name, req);
+            send_asset(out, name);
         },
         Route.ApiLibrary => {
             let kind: string = router.query_param(req.query, "kind");
             let q: string = router.query_param(req.query, "q");
-            send_simple(req, conn, webserver.json_response(api.library_json(st, kind, q)));
+            if (q.len() > MAX_QUERY) {
+                emit(out, webserver.text(414, "query too long\n"));
+                return;
+            }
+            emit(out, webserver.json_response(api.library_json(st, kind, q)));
         },
         Route.ApiStats => {
-            send_simple(req, conn, webserver.json_response(api.stats_json(st, root)));
+            emit(out, webserver.json_response(api.stats_json(st, library.base_name(root))));
         },
         Route.ApiItem(id) => {
             match (api.item_json(st, id)) {
                 Option.Some(body) => {
-                    send_simple(req, conn, webserver.json_response(body));
+                    emit(out, webserver.json_response(body));
                 },
                 Option.None => {
-                    send_not_found(req, conn, id);
+                    send_not_found(out);
                 },
             }
         },
         Route.Media(id) => {
-            serve_item(st, root, id, req, conn);
+            serve_item(st, root, id, out);
         },
         Route.Thumb(id) => {
-            serve_thumb(st, root, id, req, conn);
+            serve_thumb(st, root, id, out);
         },
         Route.Subtitle(id, index) => {
-            serve_subtitle(st, root, id, index, req, conn);
+            serve_subtitle(st, root, id, index, out);
         },
         Route.Events => {
             events.serve_sse(hub, conn);
         },
         Route.Room(name) => {
+            if (!security.valid_room_name(name)) {
+                emit(out, webserver.text(400, "invalid room name\n"));
+                return;
+            }
             room.serve_room(rooms, name, req, conn);
         },
         Route.NotFound => {
-            send_simple(req, conn, webserver.text(404, "not found\n"));
+            emit(out, webserver.text(404, "not found\n"));
         },
     }
 }
 
 // Sirve el fichero de un item por id, con Range: éste es el camino caliente.
-fn serve_item(st: Store, root: string, id: string, req: webserver.Request, conn: int) {
+fn serve_item(st: Store, root: string, id: string, out: Out) {
     match (store.find_by_id(st, id)) {
         Option.None => {
-            send_not_found(req, conn, id);
+            send_not_found(out);
         },
         Option.Some(it) => {
             match (scan.safe_path(root, it.rel)) {
-                Result.Err(e) => {
-                    send_simple(req, conn, webserver.text(404, "${e}\n"));
+                Result.Err(_) => {
+                    send_not_found(out);
                 },
                 Result.Ok(path) => {
-                    match (serve_media.serve_file(conn, path, it.mime, req)) {
-                        Result.Ok(sent) => {
-                            log_line(req, sent.status, sent.length);
-                        },
-                        Result.Err(e) => {
-                            // Un cliente que corta a mitad (cada seek lo hace) no es un fallo.
-                            eprint("media ${id}: ${e}");
-                        },
+                    let r: webserver.Response = serve_media.response_for(path, it.mime, out.req);
+                    if (emit(out, r)) {
+                        print(
+                            "${out.req.method} /media/${id} → ${r.status} (${serve_media.length_of(r)} bytes)"
+                        );
                     }
                 },
             }
@@ -180,33 +230,27 @@ fn serve_item(st: Store, root: string, id: string, req: webserver.Request, conn:
     }
 }
 
-// Miniatura: PNG reescalado, carátula embebida, o 404 si el item no tiene ninguna.
-fn serve_thumb(st: Store, root: string, id: string, req: webserver.Request, conn: int) {
+// Miniatura: un PNG reescalado (de la caché de disco), la carátula embebida en el audio (un
+// rango del propio fichero) o el original de una imagen que no se reescala. Nada de eso pasa
+// entero por la memoria.
+fn serve_thumb(st: Store, root: string, id: string, out: Out) {
     match (store.find_by_id(st, id)) {
         Option.None => {
-            send_not_found(req, conn, id);
+            send_not_found(out);
         },
         Option.Some(it) => {
             match (scan.safe_path(root, it.rel)) {
-                Result.Err(e) => {
-                    send_simple(req, conn, webserver.text(404, "${e}\n"));
+                Result.Err(_) => {
+                    send_not_found(out);
                 },
                 Result.Ok(path) => {
-                    match (thumbs.thumbnail(root, path, it)) {
-                        Option.None => {
-                            send_simple(req, conn, webserver.text(404, "no thumbnail\n"));
-                        },
-                        Option.Some(thumb) => {
-                            let mime: string = match (from_utf8(thumb[0])) {
-                                Result.Ok(m) => m,
-                                Result.Err(_) => "application/octet-stream",
-                            };
-                            var r: webserver.Response = webserver.bytes_response(200, thumb[1]);
-                            r.headers.insert("Content-Type", mime);
-                            r.headers.insert("Cache-Control", "private, max-age=86400");
-                            send_simple(req, conn, r);
-                        },
-                    }
+                    let r: webserver.Response = match (thumbs.thumbnail(root, path, it)) {
+                        Thumb.Missing => webserver.text(404, "no thumbnail\n"),
+                        Thumb.File(file, mime) => serve_media.response_for(file, mime, out.req),
+                        Thumb.Range(file, from_byte, to_byte, mime) => thumbs.range_response(file, from_byte, to_byte, mime),
+                    };
+                    r.headers.insert("Cache-Control", "private, max-age=86400");
+                    emit(out, r);
                 },
             }
         },
@@ -215,38 +259,34 @@ fn serve_thumb(st: Store, root: string, id: string, req: webserver.Request, conn
 
 // Una pista de subtítulos, siempre como WebVTT: un .srt se convierte al vuelo porque el
 // <track> del navegador no sabe leerlo.
-fn serve_subtitle(
-    st: Store,
-    root: string,
-    id: string,
-    index: int,
-    req: webserver.Request,
-    conn: int
-) {
+fn serve_subtitle(st: Store, root: string, id: string, index: int, out: Out) {
     match (store.find_by_id(st, id)) {
         Option.None => {
-            send_not_found(req, conn, id);
+            send_not_found(out);
         },
         Option.Some(it) => {
             if (index < 0 || index >= it.tracks.len()) {
-                send_simple(req, conn, webserver.text(404, "no such subtitle track\n"));
+                emit(out, webserver.text(404, "no such subtitle track\n"));
                 return;
             }
             let track: Track = it.tracks[index];
             match (scan.safe_path(root, track.rel)) {
-                Result.Err(e) => {
-                    send_simple(req, conn, webserver.text(404, "${e}\n"));
+                Result.Err(_) => {
+                    send_not_found(out);
                 },
                 Result.Ok(path) => {
                     match (subtitles.load_as_vtt(path, track.format)) {
                         Result.Err(e) => {
-                            send_simple(req, conn, webserver.text(500, "${e}\n"));
+                            // Sin detalles internos: el motivo va al registro, no al cliente.
+                            eprint("subtitle ${track.rel}: ${e}");
+                            let status: int = if (e.contains("too large")) { 413 } else { 500 };
+                            emit(out, webserver.text(status, "subtitle unavailable\n"));
                         },
                         Result.Ok(vtt) => {
                             var r: webserver.Response = webserver.text(200, vtt);
                             r.headers.insert("Content-Type", "text/vtt; charset=utf-8");
                             r.headers.insert("Cache-Control", "private, max-age=3600");
-                            send_simple(req, conn, r);
+                            emit(out, r);
                         },
                     }
                 },
@@ -255,31 +295,32 @@ fn serve_subtitle(
     }
 }
 
-// Los assets de la UI viven en `assets/` y viajan por `std/embed`: en disco bajo `ray run`
-// y horneados dentro del binario con `ray build --native`.
-// Los assets de la UI se sirven con el mount de `std/embed` del paquete: saneo de la
-// ruta, ETag de contenido, 304 y MIME por extensión, en disco bajo `ray run` y horneados
-// en el binario nativo. La petición se reescribe para que `/` sea `/assets/index.html`.
-fn send_asset(conn: int, name: string, req: webserver.Request) {
-    req.path = "/assets/" + name;
-    send_simple(req, conn, webserver.static_mount_embedded("/assets/", "assets", req));
+// Los assets de la UI se sirven con el mount de `std/embed` del paquete: saneo de la ruta,
+// ETag de contenido, 304 y MIME por extensión, en disco bajo `ray run` y horneados en el
+// binario nativo. La petición se reescribe para que `/` sea `/assets/index.html`.
+fn send_asset(out: Out, name: string) {
+    out.req.path = "/assets/" + name;
+    emit(out, webserver.static_mount_embedded("/assets/", "assets", out.req));
 }
 
-fn send_not_found(req: webserver.Request, conn: int, id: string) {
-    var r: webserver.Response = webserver.json_response(api.error_json("no such item: ${id}"));
+fn send_not_found(out: Out) {
+    var r: webserver.Response = webserver.json_response(api.error_json("not found"));
     r.status = 404;
-    send_simple(req, conn, r);
+    emit(out, r);
 }
 
-fn send_simple(req: webserver.Request, conn: int, r: webserver.Response) {
-    match (webserver.send_response_for(req, conn, r)) {
-        Result.Ok(_) => { },
+// El punto único de salida: cabeceras de seguridad, la cookie del token si toca, y el emisor
+// que respeta el HEAD. Devuelve si se pudo escribir.
+fn emit(out: Out, r: webserver.Response) -> bool {
+    let hardened: webserver.Response = security.harden(r, out.req);
+    if (out.cookie != "") {
+        hardened.set_cookie.push(out.cookie);
+    }
+    match (webserver.send_response_for(out.req, out.conn, hardened)) {
+        Result.Ok(_) => true,
         Result.Err(e) => {
             eprint("send: ${e}");
+            false
         },
     }
-}
-
-fn log_line(req: webserver.Request, status: int, sent: int) {
-    print("${req.method} ${req.path} → ${status} (${sent} bytes)");
 }

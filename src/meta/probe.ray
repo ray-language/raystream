@@ -208,21 +208,78 @@ fn apply_mp4(it: Item, info: mp4.Mp4Info) {
     }
 }
 
-/// The embedded cover of an audio file: `[mime, data]`, or two empty values when there
-/// is none. Read on demand by `/thumb`, never kept in the index.
-pub fn cover_of(path: string) -> [bytes] {
-    let head: bytes = read_window(path, 0, HEAD_WINDOW);
-    let tag_bytes: int = id3.tag_size(head);
-    if (tag_bytes == 0) {
-        return [b"", b""];
+/// Where an audio file keeps its embedded cover: an inclusive byte range and a MIME type.
+pub struct Cover {
+    from_byte: int,
+    to_byte: int,
+    mime: string,
+}
+
+/// Locates the embedded cover of an audio file WITHOUT reading it: frame headers only, plus
+/// the few octets before the picture that say where it starts. The result is a byte range of
+/// the file itself, served straight from disk by `/thumb`.
+pub fn cover_range(path: string) -> Option<Cover> {
+    match (fs.open(path, "r")) {
+        Result.Err(_) => Option.None,
+        Result.Ok(h) => {
+            let found: Option<Cover> = match (id3.header_of(read_at(h, 0, 14))) {
+                Option.None => Option.None,
+                Option.Some(hd) => find_cover(h, hd),
+            };
+            close(h);
+            found
+        },
     }
-    let tag_data: bytes = if (tag_bytes > head.len()) {
-        read_window(path, 0, tag_bytes)
-    } else {
-        head
-    };
-    let tags: id3.Tags = id3.parse(tag_data);
-    [tags.cover_mime.to_bytes(), tags.cover]
+}
+
+fn find_cover(h: int, hd: id3.Header) -> Option<Cover> {
+    let header_len: int = id3.frame_header_len(hd.major);
+    var pos: int = hd.first_frame;
+    while (pos + header_len <= hd.total) {
+        let fh: id3.FrameHeader = id3.frame_header_of(read_at(h, pos, header_len), hd.major);
+        if (fh.id == "" || fh.id.starts_with("\0") || fh.size <= 0) {
+            return Option.None;
+        }
+        let body: int = pos + header_len;
+        if (body + fh.size > hd.total) {
+            return Option.None;
+        }
+        if (id3.field_of(fh.id) == "cover") {
+            let short_form: bool = fh.id == "PIC";
+            let prefix: bytes = read_at(h, body, min_int(fh.size, PICTURE_PREFIX));
+            let start: int = id3.picture_data_offset(prefix, short_form);
+            if (start >= 0 && fh.size > start) {
+                let declared: string = from_utf8(id3.picture_mime(prefix, short_form)).unwrap_or(
+                    ""
+                );
+                return Option.Some(
+                    Cover {
+                        from_byte: body + start,
+                        to_byte: body + fh.size - 1,
+                        mime: safe_image_mime(declared)
+                    }
+                );
+            }
+        }
+        pos = body + fh.size;
+    }
+    Option.None
+}
+
+/// The declared MIME type when it is one of the raster formats browsers render as an image,
+/// otherwise `image/jpeg`. It goes into a response header (so no CR/LF may pass) and decides
+/// how the browser treats the bytes (so no `image/svg+xml`: an SVG can carry scripts).
+pub fn safe_image_mime(declared: string) -> string {
+    let m: string = declared.trim().to_lower();
+    let allowed: [string] = [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+        "image/avif",
+        "image/bmp"
+    ];
+    if (allowed.contains(m)) { m } else { "image/jpeg" }
 }
 
 /// Reads at most `max` octets starting at `offset`. Bounded memory by construction:
@@ -380,4 +437,40 @@ fn an_empty_apic_frame_is_not_a_cover() {
     assert(!it.has_cover);
     assert_eq(id3.parse(file).cover.len(), 0);
     fs.remove_all(root).unwrap_or(0);
+}
+
+@test
+fn the_cover_is_located_as_a_range_of_the_file() {
+    let root: string = fs.make_temp_dir("raystream_cover").unwrap_or("");
+    let image_bytes: bytes = bytes_of([0x89, 0x50, 0x4E, 0x47, 1, 2, 3, 4, 5, 6]);
+    let apic: bytes = bytes_of([0])
+        + b"image/png"
+        + bytes_of([0, 3])
+        + b"front"
+        + bytes_of([0])
+        + image_bytes;
+    let frames: bytes = id3_frame("TIT2", bytes_of([0]) + b"t") + id3_frame("APIC", apic);
+    let n: int = frames.len();
+    let file: bytes = b"ID3" + bytes_of([3, 0, 0, 0, 0, (n / 128) % 128, n % 128]) + frames;
+    fs.write_file_bytes(root + "/c.mp3", file).unwrap_or(0);
+    match (cover_range(root + "/c.mp3")) {
+        Option.Some(c) => {
+            assert_eq(c.mime, "image/png");
+            assert_eq(file.sub_bytes(c.from_byte, c.to_byte + 1), image_bytes);
+            // El mismo tramo que da el parser completo.
+            assert_eq(id3.parse(file).cover, image_bytes);
+        },
+        Option.None => panic("the cover should be found"),
+    }
+    fs.remove_all(root).unwrap_or(0);
+}
+
+@test
+fn a_hostile_cover_mime_cannot_reach_a_header() {
+    assert_eq(safe_image_mime("image/png"), "image/png");
+    assert_eq(safe_image_mime("IMAGE/JPEG"), "image/jpeg");
+    assert_eq(safe_image_mime("image/svg+xml"), "image/jpeg");
+    assert_eq(safe_image_mime("image/jpeg\r\nSet-Cookie: x=1"), "image/jpeg");
+    assert_eq(safe_image_mime("text/html"), "image/jpeg");
+    assert_eq(safe_image_mime(""), "image/jpeg");
 }

@@ -17,8 +17,14 @@ Probado con **raylang 1.27.16** y el paquete **net 0.4.1**.
 ray run                       # sirve ./media en http://127.0.0.1:8080
 ray run -- --dir ~/Movies --port 9000
 ray run -- --scan-only        # indexa, imprime el catálogo y sale
+ray run -- --host 0.0.0.0     # modo red local: exige token (imprime la URL para entrar)
 ray run -- --help
 ```
+
+Por defecto sólo escucha en `127.0.0.1`. Para verlo desde la tele o el móvil, `--host 0.0.0.0`
+activa el **modo red local**: toda petición necesita un token, que se imprime al arrancar como una
+URL lista para abrir una vez en cada dispositivo. El tráfico va sin cifrar: úsalo en redes de
+confianza. Detalles en [SECURITY.md](SECURITY.md).
 
 Si el directorio de la biblioteca está vacío, la aplicación genera contenido de muestra real
 (PNG sintéticos y WAV con un tono) para que haya algo que ver desde el primer arranque. **Vídeo no
@@ -101,7 +107,8 @@ actores y se habla con ellos por canales:
 | `src/http/` | `serve_media` (MIME del índice y log sobre `webserver.serve_file`), `api` (JSON) |
 | `src/live/` | `events` (SSE + vigilante), `room` (salas WebSocket) |
 | `src/subtitles.ray` | descubrimiento de pistas y conversión SRT → WebVTT |
-| `src/thumbs.ray` | reescalado PNG y caché |
+| `src/security.ray` | política de red (`Host`, `Origin`, token del modo red local), cabeceras de seguridad y validadores |
+| `src/thumbs.ray` | reescalado PNG y caché; carátulas como rango del fichero, sin cargarlas |
 | `src/samples.ray` | contenido de muestra |
 | `bench/` | el banco de pruebas, también en raylang: caudal y concurrencia, escala de la biblioteca, clientes lentos, probe con ficheros reales, A/B de escritores y descomposición de memoria |
 | `findings/` | un repro mínimo por hallazgo y `check.ray`, que los reverifica todos contra el raylang instalado |
@@ -120,7 +127,7 @@ VM y **32 ms** en el binario nativo, y 0,4 ms si ya está cacheada.
 ## Tests
 
 ```sh
-ray test                        # la suite completa (52)
+ray test                        # la suite completa (68)
 ray run findings/check.ray      # los 23 hallazgos contra el raylang instalado
 ray test src/meta/id3.ray       # un módulo
 ```
@@ -160,6 +167,14 @@ curl -s "localhost:8080/subs/<id>/0" | head -4
 - La duración de un MP3 VBR es una estimación; la de MP4 y WAV es exacta.
 - Los subtítulos son ficheros hermanos: no se extraen las pistas incrustadas en el contenedor
   (haría falta demuxar MP4/Matroska).
+
+## Seguridad
+
+Ver [SECURITY.md](SECURITY.md): modelo de amenazas, qué protege cada modo, límites y riesgos que
+quedan. En resumen: la interfaz nunca interpreta como HTML lo que viene de la biblioteca (etiquetas
+ID3, nombres de fichero), una CSP estricta lo respalda, otras webs no pueden leer el catálogo ni
+abrir salas desde tu navegador, el modo red local exige token, y ningún fichero de la biblioteca
+—por grande que sea— se carga entero en memoria.
 
 ## Licencia
 

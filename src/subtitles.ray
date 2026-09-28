@@ -59,8 +59,18 @@ pub fn looks_like_language(piece: string) -> bool {
     true
 }
 
-/// Reads a sidecar file and returns it as WebVTT, ready to serve.
+/// Largest subtitle file served. A film's subtitles are tens of KB; this is generous and still
+/// keeps a hostile 64 MB ".srt" from being loaded (and converted, several copies deep) per
+/// request — six at once cost +2 GB of RSS before the cap (SECURITY.md).
+pub const MAX_SUBTITLE_BYTES: int = 4194304;
+
+/// Reads a sidecar file and returns it as WebVTT, ready to serve. `Err("too large")` beyond
+/// `MAX_SUBTITLE_BYTES`, checked with `stat` before reading anything.
 pub fn load_as_vtt(path: string, ext: string) -> Result<string, string> {
+    let st: fs.Stat = fs.stat(path)?;
+    if (st.size > MAX_SUBTITLE_BYTES) {
+        return Result.Err("too large (${st.size} bytes)");
+    }
     let raw: bytes = fs.read_file_bytes(path)?;
     let text: string = decode(raw);
     if (ext == "vtt") {
@@ -108,7 +118,9 @@ fn latin1(b: bytes) -> string {
 /// `,` of the timestamps becomes `.`, and CRLF endings are normalised.
 pub fn srt_to_vtt(srt: string) -> string {
     let lines: [string] = srt.replace("\r\n", "\n").replace("\r", "\n").split("\n");
-    var out: string = "WEBVTT\n\n";
+    // Las líneas se juntan una vez al final: concatenar sobre un `string` que crece copia todo
+    // lo anterior en cada vuelta (cuadrático en el tamaño del fichero).
+    var out: [string] = ["WEBVTT", ""];
     var i: int = 0;
     while (i < lines.len()) {
         let line: string = lines[i].trim();
@@ -117,17 +129,17 @@ pub fn srt_to_vtt(srt: string) -> string {
             continue;
         }
         if (is_timing(line)) {
-            out = out + convert_timing(line) + "\n";
+            out.push(convert_timing(line));
             // El texto del cue va hasta la siguiente línea en blanco.
             while (i < lines.len() && lines[i].trim() != "") {
-                out = out + lines[i] + "\n";
+                out.push(lines[i]);
                 i = i + 1;
             }
-            out = out + "\n";
+            out.push("");
         }
         // Una línea suelta que no es tiempo es el número de cue: se descarta.
     }
-    out
+    join(out, "\n") + "\n"
 }
 
 /// Adds the `WEBVTT` header when a .vtt file is missing it (some tools omit it).
@@ -214,6 +226,17 @@ fn reads_a_sidecar_from_disk() {
     match (load_as_vtt(root + "/missing.srt", "srt")) {
         Result.Ok(_) => panic("a missing file must fail"),
         Result.Err(_) => { },
+    }
+    fs.remove_all(root).unwrap_or(0);
+}
+
+@test
+fn oversized_subtitles_are_refused_before_reading() {
+    let root: string = fs.make_temp_dir("raystream_bigsub").unwrap_or("");
+    fs.write_file(root + "/big.srt", "x".repeat(MAX_SUBTITLE_BYTES + 1)).unwrap_or(0);
+    match (load_as_vtt(root + "/big.srt", "srt")) {
+        Result.Ok(_) => panic("an oversized subtitle must be refused"),
+        Result.Err(e) => assert(e.contains("too large")),
     }
     fs.remove_all(root).unwrap_or(0);
 }

@@ -46,43 +46,74 @@ async function loadLibrary() {
   render();
 }
 
+// Todo lo que viene de la biblioteca (nombres de fichero, etiquetas ID3, rutas) es texto que
+// otro ha escrito: se inserta SIEMPRE con textContent o como valor de atributo, nunca como
+// HTML. Un MP3 titulado `<img src=x onerror=…>` se ve tal cual, no se ejecuta.
+function el(tag, props, children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props || {})) {
+    if (key === 'text') node.textContent = value;
+    else if (key === 'className') node.className = value;
+    else node.setAttribute(key, value);
+  }
+  for (const child of children || []) node.append(child);
+  return node;
+}
+
 function render() {
-  grid.innerHTML = '';
   if (!items.length) {
-    grid.innerHTML = '<li class="empty">Nothing here yet — drop files into the library directory.</li>';
+    grid.replaceChildren(el('li', { className: 'empty', text: 'Nothing here yet — drop files into the library directory.' }));
     return;
   }
-  for (const it of items) {
-    const li = document.createElement('li');
-    li.className = 'card';
+  const cards = items.map(it => {
     const dims = it.width ? `${it.width}×${it.height}` : '';
     const cc = (it.subtitles || []).length ? 'CC' : '';
     const sub = [it.kind, human(it.size), duration(it.duration_ms) || dims, cc].filter(Boolean).join(' · ');
-    const thumb = (it.kind === 'image' || it.has_cover)
-      ? `<div class="thumb" style="background-image:url('/thumb/${it.id}')"></div>`
-      : `<div class="thumb">${icons[it.kind] || '•'}</div>`;
-    li.innerHTML = `${thumb}<div class="body"><div class="name">${it.title || it.name}</div><div class="sub">${sub}</div></div>`;
+    const thumb = el('div', { className: 'thumb' });
+    if (it.kind === 'image' || it.has_cover) {
+      // encodeURIComponent: el id es hex, pero nada que acabe en una URL se da por bueno.
+      thumb.style.backgroundImage = `url("/thumb/${encodeURIComponent(it.id)}")`;
+    } else {
+      thumb.textContent = icons[it.kind] || '•';
+    }
+    const li = el('li', { className: 'card' }, [
+      thumb,
+      el('div', { className: 'body' }, [
+        el('div', { className: 'name', text: it.title || it.name }),
+        el('div', { className: 'sub', text: sub }),
+      ]),
+    ]);
     li.addEventListener('click', () => open(it, true));
-    grid.appendChild(li);
-  }
+    return li;
+  });
+  grid.replaceChildren(...cards);
 }
 
 function open(it, broadcast) {
   current = it;
   stage.hidden = false;
-  const src = '/media/' + it.id;
-  const tracks = (it.subtitles || []).map((t, i) =>
-    `<track kind="subtitles" src="${t.url}" srclang="${t.lang || 'und'}" label="${t.label}"${i === 0 ? ' default' : ''}>`
-  ).join('');
-  let player;
-  if (it.kind === 'video') player = `<video src="${src}" controls autoplay playsinline>${tracks}</video>`;
-  else if (it.kind === 'audio') player = `<audio src="${src}" controls autoplay>${tracks}</audio>`;
-  else player = `<img src="${src}" alt="${it.name}">`;
-  const subs = (it.subtitles || []).length
-    ? ` · CC ${it.subtitles.map(t => t.label).join(', ')}`
-    : '';
+  const src = '/media/' + encodeURIComponent(it.id);
+  let media;
+  if (it.kind === 'video' || it.kind === 'audio') {
+    media = el(it.kind, { src, controls: '', autoplay: '' });
+    if (it.kind === 'video') media.setAttribute('playsinline', '');
+    (it.subtitles || []).forEach((t, i) => {
+      const track = el('track', { kind: 'subtitles', src: t.url, srclang: t.lang || 'und', label: t.label });
+      if (i === 0) track.default = true;
+      media.append(track);
+    });
+  } else {
+    media = el('img', { src, alt: it.name });
+  }
+  const subs = (it.subtitles || []).length ? ` · CC ${it.subtitles.map(t => t.label).join(', ')}` : '';
   const line = [it.artist, it.album].filter(Boolean).join(' — ');
-  stage.innerHTML = `${player}<div class="meta"><div class="title">${it.title || it.name}</div>${(line || it.rel) + subs}</div>`;
+  stage.replaceChildren(
+    media,
+    el('div', { className: 'meta' }, [
+      el('div', { className: 'title', text: it.title || it.name }),
+      (line || it.rel) + subs,
+    ]),
+  );
   wirePlayer();
   if (broadcast) send({ type: 'load', item_id: it.id, position_ms: 0 });
   stage.scrollIntoView({ behavior: 'smooth', block: 'start' });

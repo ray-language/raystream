@@ -5,12 +5,17 @@
 // y una por conexión SSE. Todas hablan por canales: ningún estado compartido.
 import std/fs;
 import std/json;
+import std/net;
 import std/time;
 import catalog/indexer;
 import catalog/store;
 import net/webserver;
 from catalog/library import Item;
 from catalog/store import Store;
+
+/// Browsers subscribed to /events at once. Each one holds a connection slot for as long as
+/// the tab stays open, so the cap keeps them from starving the media (128 slots in all).
+pub const MAX_SUBSCRIBERS: int = 32;
 
 // Alta de un suscriptor: su canal de eventos y por dónde devolverle su identificador.
 // (No se llama `Sub`: ese nombre choca con el trait del prelude — NOTES-raylang.md, 8.)
@@ -56,10 +61,15 @@ fn run(inbox: Channel<HubMsg>) {
             Option.Some(msg) => {
                 match (msg) {
                     HubMsg.Subscribe(sub) => {
-                        ids.push(next_id);
-                        chans.push(sub.ch);
-                        send(sub.reply, next_id);
-                        next_id = next_id + 1;
+                        if (ids.len() >= MAX_SUBSCRIBERS) {
+                            // 0 = no hay sitio.
+                            send(sub.reply, 0);
+                        } else {
+                            ids.push(next_id);
+                            chans.push(sub.ch);
+                            send(sub.reply, next_id);
+                            next_id = next_id + 1;
+                        }
                     },
                     HubMsg.Unsubscribe(id) => {
                         var keep_ids: [int] = [];
@@ -109,10 +119,11 @@ pub fn serve_sse(hub: Hub, conn: int) {
     let ch: Channel<string> = Channel.new();
     let reply: Channel<int> = Channel.new();
     send(hub.inbox, HubMsg.Subscribe(Listener { ch: ch, reply: reply }));
-    let id: int = match (recv(reply)) {
-        Option.Some(v) => v,
-        Option.None => 0,
-    };
+    let id: int = recv(reply).unwrap_or(0);
+    if (id == 0) {
+        webserver.send_response(conn, webserver.text(503, "too many listeners\n")).unwrap_or(0);
+        return;
+    }
     match (webserver.sse_open(conn)) {
         Result.Err(_) => {
             send(hub.inbox, HubMsg.Unsubscribe(id));
@@ -129,23 +140,57 @@ pub fn serve_sse(hub: Hub, conn: int) {
         },
         Result.Ok(_) => { },
     }
+    // Un cliente de SSE no envía nada después de la petición, así que una lectura sólo vuelve
+    // cuando se ha ido. Esta fibra lo vigila: sin ella, el hueco de un navegador (o de un
+    // atacante) que cierra no se liberaba hasta el siguiente latido, 20 s después.
+    let gone: Channel<string> = Channel.new();
+    net.set_read_timeout(conn, 0);
+    spawn(fn() {
+        wait_for_close(conn);
+        send(gone, "");
+    });
     var go: bool = true;
     while (go) {
-        match (recv(ch)) {
-            Option.None => {
-                go = false;
+        let ready: int = select([ch, gone]);
+        if (ready == 1) {
+            go = false;
+        } else {
+            match (recv(ch)) {
+                Option.None => {
+                    go = false;
+                },
+                Option.Some(payload) => {
+                    match (webserver.sse_event(conn, payload)) {
+                        Result.Err(_) => {
+                            go = false;
+                        },
+                        Result.Ok(_) => { },
+                    }
+                },
+            }
+        }
+    }
+    send(hub.inbox, HubMsg.Unsubscribe(id));
+}
+
+// Lee de la conexión hasta que el cliente la cierra. Lo que llegue se descarta; un timeout
+// de lectura no cuenta como cierre.
+fn wait_for_close(conn: int) {
+    var go: bool = true;
+    while (go) {
+        match (net.socket_read_bytes(conn)) {
+            Result.Ok(chunk) => {
+                if (chunk.len() == 0) {
+                    go = false;
+                }
             },
-            Option.Some(payload) => {
-                match (webserver.sse_event(conn, payload)) {
-                    Result.Err(_) => {
-                        go = false;
-                    },
-                    Result.Ok(_) => { },
+            Result.Err(e) => {
+                if (!e.to_lower().contains("timed out") && !e.to_lower().contains("timeout")) {
+                    go = false;
                 }
             },
         }
     }
-    send(hub.inbox, HubMsg.Unsubscribe(id));
 }
 
 /// Starts the directory watcher: kernel events (FSEvents/inotify), coalesced, then a
@@ -250,4 +295,19 @@ fn the_hub_fans_out_to_every_subscriber() {
         Received.Empty => { },
         Received.Closed => { },
     }
+}
+
+@test
+fn the_hub_caps_its_subscribers() {
+    let hub: Hub = start();
+    var i: int = 0;
+    while (i < MAX_SUBSCRIBERS) {
+        let reply: Channel<int> = Channel.new();
+        send(hub.inbox, HubMsg.Subscribe(Listener { ch: Channel.new(), reply: reply }));
+        assert(recv(reply).unwrap_or(0) > 0);
+        i = i + 1;
+    }
+    let reply: Channel<int> = Channel.new();
+    send(hub.inbox, HubMsg.Subscribe(Listener { ch: Channel.new(), reply: reply }));
+    assert_eq(recv(reply).unwrap_or(0 - 1), 0);
 }

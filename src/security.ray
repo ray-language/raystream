@@ -1,0 +1,259 @@
+// La política de seguridad de la red: quién puede hablar con el servidor y qué cabeceras
+// acompañan a cada respuesta. Ver SECURITY.md para el modelo de amenazas.
+//
+// Dos modos:
+//   - Loopback (por defecto): sólo esta máquina llega al puerto, pero el navegador del usuario
+//     sí, y con él cualquier web que visite. Se exige que el `Host` sea uno de los nombres del
+//     propio servidor (para el DNS rebinding: la web del atacante resuelve su dominio a
+//     127.0.0.1 y pasa a ser "del mismo origen") y que un `Origin` presente coincida con el
+//     `Host` (para que otra web no abra la sala por WebSocket).
+//   - Red local (`--host` no loopback): el servidor no puede saber con qué nombre lo llamarán,
+//     así que la puerta es un token. Lo exige el propio paquete `net` (`Limits.local_token`)
+//     antes de llegar al manejador; aquí se siembra la cookie cuando llega en la URL.
+import config;
+import net/webserver;
+from config import Config;
+
+/// The network policy decided at startup.
+pub struct Policy {
+    // Valores de `Host` aceptados (en minúsculas); vacío = no se comprueba (modo red local).
+    hosts: [string],
+    // Token de acceso del modo red local; vacío = modo loopback.
+    token: string,
+}
+
+/// The policy for a configuration: an allow-list of `Host` values in loopback mode, a token in
+/// LAN mode (the configured one, or a fresh 128-bit one from the package's CSPRNG). On
+/// loopback an explicit `--token` is required as well, for machines shared with other users.
+pub fn policy_for(cfg: Config) -> Policy {
+    if (config.is_loopback(cfg.host)) {
+        let p: string = to_string(cfg.port);
+        var hosts: [string] = ["127.0.0.1:${p}", "localhost:${p}", "[::1]:${p}"];
+        if (cfg.port == 80) {
+            hosts = hosts + ["127.0.0.1", "localhost", "[::1]"];
+        }
+        Policy { hosts: hosts, token: cfg.token }
+    } else {
+        let token: string = if (cfg.token != "") { cfg.token } else { webserver.local_token() };
+        Policy { hosts: [], token: token }
+    }
+}
+
+/// Whether every request needs the access token (always in LAN mode; on loopback, when a
+/// `--token` was given).
+pub fn requires_token(p: Policy) -> bool {
+    p.token != ""
+}
+
+/// The response that refuses `req`, or `None` when it may proceed.
+pub fn refuse(req: webserver.Request, p: Policy) -> Option<webserver.Response> {
+    let host: string = req.headers.get("host").unwrap_or("").to_lower();
+    if (p.hosts.len() > 0 && !p.hosts.contains(host)) {
+        // DNS rebinding: el navegador cree hablar con el dominio del atacante.
+        return Option.Some(webserver.text(421, "misdirected request\n"));
+    }
+    match (req.headers.get("origin")) {
+        Option.None => { },
+        Option.Some(origin) => {
+            if (origin != "null" && origin_host(origin) != host) {
+                // Otra web: un fetch con credenciales, un EventSource o un WebSocket.
+                return Option.Some(webserver.text(403, "cross-origin request refused\n"));
+            }
+        },
+    }
+    Option.None
+}
+
+/// The host part (`host[:port]`, lowercase) of an origin such as `http://host:port`.
+pub fn origin_host(origin: string) -> string {
+    let o: string = origin.to_lower();
+    let rest: string = if (o.starts_with("http://")) {
+        o.substring(7, o.len())
+    } else if (o.starts_with("https://")) {
+        o.substring(8, o.len())
+    } else {
+        return "";
+    };
+    match (rest.index_of("/")) {
+        Option.Some(i) => rest.substring(0, i),
+        Option.None => rest,
+    }
+}
+
+/// Adds the defensive headers every response carries. The CSP only allows this server's own
+/// scripts, styles, images, media and connections (WebSocket included, spelled out because
+/// older WebKit does not match `ws:` against `'self'`).
+pub fn harden(r: webserver.Response, req: webserver.Request) -> webserver.Response {
+    let host: string = req.headers.get("host").unwrap_or("");
+    let ws: string = if (host == "") { "" } else { " ws://${host} wss://${host}" };
+    r.headers.insert(
+        "Content-Security-Policy",
+        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; media-src 'self'; "
+            + "connect-src 'self'${ws}; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    );
+    r.headers.insert("X-Content-Type-Options", "nosniff");
+    r.headers.insert("Cross-Origin-Resource-Policy", "same-origin");
+    r.headers.insert("Referrer-Policy", "no-referrer");
+    r.headers.insert("X-Frame-Options", "DENY");
+    r
+}
+
+/// In LAN mode, the `Set-Cookie` line that must go with this response: when the token came in
+/// the URL (`?ray_token=`), the browser keeps it as an HttpOnly, SameSite=Strict cookie so the
+/// page's own requests, EventSource and WebSocket carry it without repeating it.
+pub fn token_cookie_for(req: webserver.Request, p: Policy) -> string {
+    if (!requires_token(p)) {
+        return "";
+    }
+    let (ok, via_query) = webserver.local_token_via(req, p.token);
+    if (ok && via_query) { webserver.token_cookie(p.token) } else { "" }
+}
+
+/// A room name: 1 to 32 letters, digits, `-` or `_`.
+pub fn valid_room_name(name: string) -> bool {
+    if (name.len() == 0 || name.len() > 32) {
+        return false;
+    }
+    let chars: [char] = name.chars();
+    var i: int = 0;
+    while (i < chars.len()) {
+        let c: int = char_code(chars[i]);
+        let ok: bool = (c >= 48 && c <= 57)
+            || (c >= 65 && c <= 90)
+            || (c >= 97 && c <= 122)
+            || c == 45
+            || c == 95;
+        if (!ok) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+/// A catalog id as the library produces them (12 lowercase hex digits), or empty.
+pub fn valid_item_id(id: string) -> bool {
+    if (id == "") {
+        return true;
+    }
+    if (id.len() != 12) {
+        return false;
+    }
+    let chars: [char] = id.chars();
+    var i: int = 0;
+    while (i < chars.len()) {
+        let c: int = char_code(chars[i]);
+        if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102))) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+// --- Tests ---------------------------------------------------------------------------------
+
+fn request(host: string, origin: string) -> webserver.Request {
+    var h: Map<string, string> = Map.new();
+    if (host != "") {
+        h.insert("host", host);
+    }
+    if (origin != "") {
+        h.insert("origin", origin);
+    }
+    webserver.Request {
+        method: "GET",
+        path: "/",
+        query: "",
+        version: "HTTP/1.1",
+        headers: h,
+        body: b"",
+        remote: "127.0.0.1:50000"
+    }
+}
+
+fn loopback() -> Policy {
+    policy_for(Config { dir: "m", host: "127.0.0.1", port: 8080, scan_only: false, token: "" })
+}
+
+@test
+fn loopback_mode_accepts_its_own_names() {
+    let p: Policy = loopback();
+    assert(!requires_token(p));
+    assert(refuse(request("127.0.0.1:8080", ""), p).is_none());
+    assert(refuse(request("localhost:8080", ""), p).is_none());
+    assert(refuse(request("LocalHost:8080", "http://localhost:8080"), p).is_none());
+}
+
+@test
+fn dns_rebinding_is_refused() {
+    let p: Policy = loopback();
+    match (refuse(request("evil.example:8080", "http://evil.example:8080"), p)) {
+        Option.Some(r) => assert_eq(r.status, 421),
+        Option.None => panic("a foreign Host must be refused"),
+    }
+    assert(refuse(request("", ""), p).is_some());
+}
+
+@test
+fn foreign_origins_are_refused() {
+    let p: Policy = loopback();
+    match (refuse(request("127.0.0.1:8080", "http://evil.example"), p)) {
+        Option.Some(r) => assert_eq(r.status, 403),
+        Option.None => panic("a foreign Origin must be refused"),
+    }
+}
+
+@test
+fn lan_mode_has_a_token_and_no_host_list() {
+    let p: Policy = policy_for(
+        Config { dir: "m", host: "0.0.0.0", port: 8080, scan_only: false, token: "" }
+    );
+    assert(requires_token(p));
+    assert_eq(p.token.len(), 32);
+    // Cualquier Host sirve (no se sabe con qué nombre llamarán); el Origin sigue contando.
+    assert(refuse(request("192.168.1.15:8080", "http://192.168.1.15:8080"), p).is_none());
+    assert(refuse(request("192.168.1.15:8080", "http://evil.example"), p).is_some());
+}
+
+@test
+fn an_explicit_token_is_required_on_loopback_too() {
+    let p: Policy = policy_for(
+        Config {
+            dir: "m",
+            host: "127.0.0.1",
+            port: 8080,
+            scan_only: false,
+            token: "0123456789abcdef"
+        }
+    );
+    assert(requires_token(p));
+    // Y la lista de Host sigue en vigor.
+    assert(refuse(request("evil.example:8080", ""), p).is_some());
+}
+
+@test
+fn validators() {
+    assert(valid_room_name("salon"));
+    assert(valid_room_name("sala-2_b"));
+    assert(!valid_room_name(""));
+    assert(!valid_room_name("x".repeat(33)));
+    assert(!valid_room_name("<script>"));
+    assert(!valid_room_name("a b"));
+    assert(valid_item_id(""));
+    assert(valid_item_id("6d96c9a155e4"));
+    assert(!valid_item_id("6D96C9A155E4"));
+    assert(!valid_item_id("6d96c9a155e"));
+    assert(!valid_item_id("<img src=x>1"));
+}
+
+@test
+fn every_response_is_hardened() {
+    let r: webserver.Response = harden(webserver.text(200, "x"), request("127.0.0.1:8080", ""));
+    let csp: string = r.headers.get("Content-Security-Policy").unwrap_or("");
+    assert(csp.contains("script-src 'self'"));
+    assert(csp.contains("ws://127.0.0.1:8080"));
+    assert(!csp.contains("unsafe-inline"));
+    assert_eq(r.headers.get("X-Content-Type-Options").unwrap_or(""), "nosniff");
+    assert_eq(r.headers.get("Cross-Origin-Resource-Policy").unwrap_or(""), "same-origin");
+}

@@ -51,6 +51,9 @@ que coteja cada firma que cita contra la real — la propuesta del 17.
 | 21 | `import std/sort` rompía el nativo | ✅ OK | compila |
 | 22 | `ray fmt` corrompía interpolaciones anidadas | ✅ OK | tres pasadas de `fmt -w` no cambian el fichero |
 | 23 | `send_response` no sabía de HEAD | ✅ OK | `send_response_for` |
+| 24 | un `get` en la raíz desvía `map.get(k)` | 🆕 nuevo | revisión de seguridad (abajo) |
+| 25 | el emisor escribe cabeceras con `\r\n` tal cual | 🆕 nuevo | revisión de seguridad (abajo) |
+| 26 | sin respuesta pública para un rango de fichero | 🆕 nuevo | revisión de seguridad (abajo) |
 
 Una nota de compatibilidad que no es un hallazgo: entre 1.27.4 y 1.27.16 `json.render` dejó de poner
 espacio tras los dos puntos (`{"k":"v"}`). Rompió cuatro tests de raystream que comparaban texto
@@ -785,3 +788,55 @@ Verificado a nivel de socket, cuerpo real de cada HEAD:
 | `HEAD /assets/app.js` | 6327 | 0 |
 | `HEAD /subs/<id>/0` | 211 | 0 |
 | `HEAD /api/stats` | 118 | 0 |
+
+---
+
+### [24] Un `get` en la raíz desvía también `map.get(k)` — resolución de nombres · severidad: fricción
+
+**Qué pasó:** con una función `get` de tres parámetros en el módulo raíz, una llamada de **método**
+sobre un `Map` del mismo fichero —`headers.get("content-type")`— se resolvió a la función del
+usuario:
+
+```
+type error: 'get' expects 3 argument(s), received 2
+```
+
+Es coherente con la regla de M270 (el override es léxico a la raíz, y `m.get(k)` es azúcar UFCS de
+`get(m, k)`), pero sorprende: el receptor es un `Map`, y la llamada con punto parece un método que
+se resolvería por su tipo.
+
+**Propuesta:** que una llamada con receptor de un tipo del prelude (`Map`, `Option`…) prefiera el
+método de ese tipo antes que una función libre del usuario con otra aridad; o, como mínimo, que el
+error lo diga (`'headers.get' resolved to your root 'get' (3 params); rename it or call the Map
+method as …`).
+
+---
+
+### [25] El emisor escribe los valores de cabecera tal cual — `net/webserver` · severidad: fricción (seguridad)
+
+**Qué pasó:** en la revisión de seguridad de raystream, el `Content-Type` de `/thumb` salía del MIME
+que declara la carátula dentro del propio MP3. Un valor con un salto de línea acababa escrito
+literalmente en la respuesta, es decir, añadía cabeceras. El emisor de `net` (`send_response*`)
+no rechaza ni neutraliza `\r`/`\n` en nombres o valores de cabecera.
+
+**Por qué importa:** cualquier aplicación que ponga en una cabecera algo que venga de fuera (un
+nombre de fichero en `Content-Disposition`, un MIME, un valor de redirección) queda expuesta a
+inyección de cabeceras sin saberlo. El paquete es el sitio donde se puede cortar para todos.
+
+**Propuesta:** que el emisor rechace (500) o elimine `\r`, `\n` y `\0` en nombres y valores de
+cabecera, y que `Response.headers` documente la regla.
+
+**Rodeo aplicado:** lista blanca de formatos de imagen para el MIME de la carátula
+(`probe.safe_image_mime`); ninguna otra cabecera de raystream lleva datos de la biblioteca.
+
+---
+
+### [26] No hay respuesta pública para un rango de fichero con MIME propio — `net/webserver` · severidad: mejora
+
+**Qué pasó:** para servir la carátula de un MP3 sin cargarla, lo natural es responder con el tramo
+`[desde, hasta]` del propio fichero. `net` ya lo sabe hacer —`FileBody` y `file_response_len`, el
+camino de `serve_file`—, pero ambos son privados. Hubo que escribir un productor propio sobre
+`stream_response_len` (con su fibra y su canal: justo el coste del hallazgo 19 que `FileBody` evita).
+
+**Propuesta:** `pub fn file_range_response(path, from, to, content_type) -> Response`, sobre el mismo
+`FileBody`.

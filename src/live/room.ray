@@ -9,6 +9,21 @@ import std/net;
 import std/time;
 import net/webserver;
 import net/websocket;
+import security;
+
+/// Members across all rooms at once. Each one holds a connection slot for as long as it
+/// stays, so the cap keeps rooms from starving the media (the server has 128 slots).
+pub const MAX_MEMBERS: int = 32;
+
+/// Rooms alive at once (a room lives while it has members).
+pub const MAX_ROOMS: int = 16;
+
+/// Largest message accepted from a client. Room messages are a few dozen octets of JSON.
+pub const MAX_MESSAGE: int = 4096;
+
+/// Messages per second a member may send; the excess is dropped (each one is re-broadcast
+/// to the whole room, so this also bounds what one member can make the server send).
+pub const MAX_RATE: int = 10;
 
 // Lo que un cliente puede pedir y lo que la sala responde: un JSON con `type`.
 enum RoomMsg {
@@ -75,13 +90,20 @@ fn run(inbox: Channel<RoomMsg>) {
             Option.Some(msg) => {
                 match (msg) {
                     RoomMsg.Join(m) => {
-                        member_ids.push(next_id);
-                        member_rooms.push(m.room);
-                        member_chans.push(m.ch);
-                        send(m.reply, next_id);
-                        next_id = next_id + 1;
-                        let st: RoomState = ensure_room(states, m.room);
-                        send(m.ch, state_json(st, "state"));
+                        // 0 = no hay sitio: demasiados miembros, o sala nueva sin hueco.
+                        let is_new: bool = find_room(states, m.room) < 0;
+                        if (member_ids.len() >= MAX_MEMBERS
+                            || (is_new && states.len() >= MAX_ROOMS)) {
+                            send(m.reply, 0);
+                        } else {
+                            member_ids.push(next_id);
+                            member_rooms.push(m.room);
+                            member_chans.push(m.ch);
+                            send(m.reply, next_id);
+                            next_id = next_id + 1;
+                            let st: RoomState = ensure_room(states, m.room);
+                            send(m.ch, state_json(st, "state"));
+                        }
                     },
                     RoomMsg.Leave(id) => {
                         var ids: [int] = [];
@@ -99,11 +121,17 @@ fn run(inbox: Channel<RoomMsg>) {
                         member_ids = ids;
                         member_rooms = rooms;
                         member_chans = chans;
+                        // Una sala sin miembros desaparece: no se acumulan salas abandonadas.
+                        states = occupied(states, member_rooms);
                     },
                     RoomMsg.Snapshot(ask) => {
-                        send(ask.reply, state_json(ensure_room(states, ask.room), "state"));
+                        let i: int = find_room(states, ask.room);
+                        send(ask.reply, if (i < 0) { "" } else { state_json(states[i], "state") });
                     },
                     RoomMsg.Update(ch) => {
+                        if (find_room(states, ch.room) < 0) {
+                            continue;
+                        }
                         let st: RoomState = ensure_room(states, ch.room);
                         apply(st, ch);
                         let payload: string = state_json(st, "state");
@@ -119,6 +147,30 @@ fn run(inbox: Channel<RoomMsg>) {
             },
         }
     }
+}
+
+fn find_room(states: [RoomState], name: string) -> int {
+    var i: int = 0;
+    while (i < states.len()) {
+        if (states[i].name == name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+// Las salas que aún tienen algún miembro.
+fn occupied(states: [RoomState], member_rooms: [string]) -> [RoomState] {
+    var keep: [RoomState] = [];
+    var i: int = 0;
+    while (i < states.len()) {
+        if (member_rooms.contains(states[i].name)) {
+            keep.push(states[i]);
+        }
+        i = i + 1;
+    }
+    keep
 }
 
 // Devuelve la sala (creándola la primera vez). Los structs son referencias: mutar la
@@ -182,18 +234,24 @@ pub fn serve_room(rooms: Rooms, room: string, req: webserver.Request, conn: int)
         webserver.send_response(conn, r).unwrap_or(0);
         return;
     }
-    match (net.socket_write(conn, websocket.handshake_response(key))) {
-        Result.Err(_) => {
-            return;
-        },
-        Result.Ok(_) => { },
-    }
 
-    // Alta en la sala.
+    // Alta en la sala ANTES del apretón de manos: si no hay sitio, se contesta 503 sin llegar
+    // a abrir el WebSocket.
     let from_room: Channel<string> = Channel.new();
     let reply: Channel<int> = Channel.new();
     send(rooms.inbox, RoomMsg.Join(Member { room: room, ch: from_room, reply: reply }));
     let id: int = recv(reply).unwrap_or(0);
+    if (id == 0) {
+        webserver.send_response(conn, webserver.text(503, "rooms are full\n")).unwrap_or(0);
+        return;
+    }
+    match (net.socket_write(conn, websocket.handshake_response(key))) {
+        Result.Err(_) => {
+            send(rooms.inbox, RoomMsg.Leave(id));
+            return;
+        },
+        Result.Ok(_) => { },
+    }
 
     // Una fibra lee el socket y vuelca los mensajes en un canal; así la fibra principal
     // puede esperar con `select` al socket Y a la sala a la vez.
@@ -202,6 +260,8 @@ pub fn serve_room(rooms: Rooms, room: string, req: webserver.Request, conn: int)
         reader(conn, from_socket);
     });
 
+    var window_start: int = time.now();
+    var in_window: int = 0;
     var go: bool = true;
     while (go) {
         let ready: int = select([from_socket, from_room]);
@@ -211,7 +271,16 @@ pub fn serve_room(rooms: Rooms, room: string, req: webserver.Request, conn: int)
                     go = false;
                 },
                 Option.Some(text) => {
-                    handle_client_message(rooms, room, id, text);
+                    // Límite de ritmo por ventanas de un segundo: lo que sobra se descarta.
+                    let now: int = time.now();
+                    if (now - window_start >= 1000) {
+                        window_start = now;
+                        in_window = 0;
+                    }
+                    in_window = in_window + 1;
+                    if (in_window <= MAX_RATE) {
+                        handle_client_message(rooms, room, id, text);
+                    }
                 },
             }
         } else {
@@ -239,7 +308,8 @@ fn reader(conn: int, out: Channel<string>) {
     let ws: websocket.WsConn = websocket.server_conn(conn);
     var go: bool = true;
     while (go) {
-        match (websocket.read_message(ws)) {
+        // Un mensaje por encima del tope es un error de lectura: se corta la conexión.
+        match (websocket.read_message_limit(ws, MAX_MESSAGE)) {
             Result.Err(_) => {
                 go = false;
             },
@@ -264,12 +334,20 @@ fn handle_client_message(rooms: Rooms, room: string, id: int, text: string) {
     match (json.parse(text)) {
         Result.Err(_) => { },
         Result.Ok(j) => {
+            // Todo lo que llega del cliente se valida antes de guardarlo y reenviarlo a la sala.
             let action: string = json.get_string(j, "type").unwrap_or("");
-            if (action == "") {
+            if (action != "load" && action != "play" && action != "pause" && action != "seek") {
                 return;
             }
             let item_id: string = json.get_string(j, "item_id").unwrap_or("");
-            let position: int = json.get_int(j, "position_ms").unwrap_or(0);
+            if (!security.valid_item_id(item_id)) {
+                return;
+            }
+            let position: int = clamp(
+                json.get_int(j, "position_ms").unwrap_or(0),
+                0,
+                MAX_POSITION_MS
+            );
             send(
                 rooms.inbox,
                 RoomMsg.Update(
@@ -284,6 +362,13 @@ fn handle_client_message(rooms: Rooms, room: string, id: int, text: string) {
             );
         },
     }
+}
+
+/// Longest position accepted, in ms (a week: no film is longer).
+const MAX_POSITION_MS: int = 604800000;
+
+fn clamp(v: int, low: int, high: int) -> int {
+    if (v < low) { low } else if (v > high) { high } else { v }
 }
 
 @test
@@ -335,7 +420,7 @@ fn a_room_broadcasts_state_to_its_members() {
 }
 
 @test
-fn leaving_stops_the_updates() {
+fn leaving_stops_the_updates_and_an_empty_room_disappears() {
     let rooms: Rooms = start();
     let a: Channel<string> = Channel.new();
     let ra: Channel<int> = Channel.new();
@@ -349,12 +434,68 @@ fn leaving_stops_the_updates() {
             Change { room: "r", from_id: 0, action: "play", item_id: "", position_ms: 1 }
         )
     );
-    // Una consulta posterior confirma que el actor sigue vivo y con el estado aplicado.
+    // La sala se borró con su último miembro: no hay estado que consultar ni nada que difundir.
     let ask: Channel<string> = Channel.new();
     send(rooms.inbox, RoomMsg.Snapshot(Ask { room: "r", reply: ask }));
-    assert(json_bool(recv(ask).unwrap_or(""), "playing"));
+    assert_eq(recv(ask).unwrap_or("?"), "");
     match (try_recv(a)) {
         Received.Got(v) => panic("a member who left got ${v}"),
+        Received.Empty => { },
+        Received.Closed => { },
+    }
+}
+
+@test
+fn members_and_rooms_are_capped() {
+    let rooms: Rooms = start();
+    // MAX_ROOMS salas de un miembro cada una llenan el cupo de salas…
+    var i: int = 0;
+    while (i < MAX_ROOMS) {
+        assert(join_room(rooms, "room${i}") > 0);
+        i = i + 1;
+    }
+    // …así que una sala nueva ya no cabe, pero una existente sí admite otro miembro.
+    assert_eq(join_room(rooms, "one-too-many"), 0);
+    assert(join_room(rooms, "room0") > 0);
+    // Y hasta MAX_MEMBERS miembros en total.
+    var k: int = MAX_ROOMS + 1;
+    while (k < MAX_MEMBERS) {
+        assert(join_room(rooms, "room1") > 0);
+        k = k + 1;
+    }
+    assert_eq(join_room(rooms, "room1"), 0);
+}
+
+fn join_room(rooms: Rooms, name: string) -> int {
+    let ch: Channel<string> = Channel.new();
+    let reply: Channel<int> = Channel.new();
+    send(rooms.inbox, RoomMsg.Join(Member { room: name, ch: ch, reply: reply }));
+    recv(reply).unwrap_or(0)
+}
+
+@test
+fn only_valid_messages_reach_the_room() {
+    let rooms: Rooms = start();
+    let a: Channel<string> = Channel.new();
+    let ra: Channel<int> = Channel.new();
+    send(rooms.inbox, RoomMsg.Join(Member { room: "v", ch: a, reply: ra }));
+    let id: int = recv(ra).unwrap_or(0);
+    let _initial: string = recv(a).unwrap_or("");
+    // Acción desconocida, id con HTML, id demasiado largo: nada de eso se difunde.
+    handle_client_message(rooms, "v", id, "{\"type\":\"drop\"}");
+    handle_client_message(rooms, "v", id, "{\"type\":\"load\",\"item_id\":\"<img src=x>\"}");
+    handle_client_message(
+        rooms,
+        "v",
+        id,
+        "{\"type\":\"load\",\"item_id\":\"" + "a".repeat(5000) + "\"}"
+    );
+    // Uno válido sí, con la posición acotada.
+    handle_client_message(rooms, "v", id, "{\"type\":\"seek\",\"position_ms\":99999999999999}");
+    let got: string = recv(a).unwrap_or("");
+    assert_eq(json_int(got, "position_ms"), MAX_POSITION_MS);
+    match (try_recv(a)) {
+        Received.Got(v) => panic("an invalid message was broadcast: ${v}"),
         Received.Empty => { },
         Received.Closed => { },
     }
