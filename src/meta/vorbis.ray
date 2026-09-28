@@ -1,0 +1,111 @@
+// Comentarios Vorbis: las etiquetas de FLAC, Ogg Vorbis y Opus. Una lista de `CLAVE=valor`
+// en UTF-8 con longitudes little-endian:
+//
+//   vendor_len (4) · vendor · count (4) · { len (4) · "CLAVE=valor" } × count
+//
+// El parser tolera un bloque truncado (la ventana de lectura puede cortar un comentario largo,
+// típicamente una carátula en base64): se queda con lo que haya leído entero.
+import meta/binary;
+
+/// The tags raystream shows.
+pub struct Tags {
+    title: string,
+    artist: string,
+    album: string,
+}
+
+/// Longest value kept; longer ones are cut (titles and names, not essays).
+const MAX_VALUE: int = 4096;
+
+/// Parses the comment list that starts at `at` in `b`. Unknown keys are ignored, and the
+/// first TITLE, ARTIST and ALBUM win.
+pub fn comments(b: bytes, at: int) -> Tags {
+    var tags: Tags = Tags { title: "", artist: "", album: "" };
+    if (at + 4 > b.len()) {
+        return tags;
+    }
+    let vendor_len: int = binary.le_u32(b, at);
+    var pos: int = at + 4 + vendor_len;
+    if (pos + 4 > b.len()) {
+        return tags;
+    }
+    let count: int = binary.le_u32(b, pos);
+    pos = pos + 4;
+    var i: int = 0;
+    while (i < count && pos + 4 <= b.len()) {
+        let len: int = binary.le_u32(b, pos);
+        let body: int = pos + 4;
+        if (len < 0 || body + len > b.len()) {
+            return tags;
+        }
+        apply(tags, b.sub_bytes(body, body + min_int(len, MAX_VALUE + 16)));
+        pos = body + len;
+        i = i + 1;
+    }
+    tags
+}
+
+// Un comentario `CLAVE=valor`: la clave no distingue mayúsculas.
+fn apply(tags: Tags, entry: bytes) {
+    let text: string = from_utf8(entry).unwrap_or("");
+    match (text.index_of("=")) {
+        Option.None => { },
+        Option.Some(eq) => {
+            let key: string = text.substring(0, eq).to_upper();
+            var value: string = text.substring(eq + 1, text.len()).trim();
+            if (value.len() > MAX_VALUE) {
+                value = value.substring(0, MAX_VALUE);
+            }
+            if (key == "TITLE" && tags.title == "") {
+                tags.title = value;
+            } else if (key == "ARTIST" && tags.artist == "") {
+                tags.artist = value;
+            } else if (key == "ALBUM" && tags.album == "") {
+                tags.album = value;
+            }
+        },
+    }
+}
+
+fn min_int(a: int, b: int) -> int {
+    if (a < b) { a } else { b }
+}
+
+/// A comment list, for the tests of this module and of the containers that carry one.
+pub fn encode(vendor: string, entries: [string]) -> bytes {
+    var out: bytes = le32(vendor.len()) + vendor.to_bytes() + le32(entries.len());
+    var i: int = 0;
+    while (i < entries.len()) {
+        let e: bytes = entries[i].to_bytes();
+        out = out + le32(e.len()) + e;
+        i = i + 1;
+    }
+    out
+}
+
+fn le32(n: int) -> bytes {
+    bytes_of([n % 256, (n / 256) % 256, (n / 65536) % 256, (n / 16777216) % 256])
+}
+
+@test
+fn reads_the_known_keys_in_any_case() {
+    let b: bytes = encode(
+        "raystream",
+        ["title=Canción", "ARTIST=Alguien", "Album=Disco", "GENRE=x", "TITLE=segundo"]
+    );
+    let t: Tags = comments(b, 0);
+    assert_eq(t.title, "Canción");
+    assert_eq(t.artist, "Alguien");
+    assert_eq(t.album, "Disco");
+}
+
+@test
+fn a_truncated_list_keeps_what_was_complete() {
+    let b: bytes = encode("v", ["TITLE=Entero", "ARTIST=Cortado por la ventana"]);
+    let t: Tags = comments(b.sub_bytes(0, b.len() - 5), 0);
+    assert_eq(t.title, "Entero");
+    assert_eq(t.artist, "");
+    // Basura: ni un pánico ni etiquetas.
+    assert_eq(comments(bytes_of([255, 255, 255, 127]), 0).title, "");
+    assert_eq(comments(b"", 0).title, "");
+}

@@ -1,0 +1,293 @@
+// Ogg: Vorbis, Opus y FLAC dentro de Ogg. Duración y etiquetas con una ventana de cabeza y
+// otra de cola, nunca el fichero entero.
+//
+// Un Ogg es una sucesión de páginas:
+//   "OggS" · versión · tipo · granule (8, LE) · serie (4) · secuencia (4) · crc (4)
+//   · n_segmentos (1) · tabla de segmentos (n) · datos
+// Los paquetes del códec se reparten en segmentos: uno de 255 octetos dice "el paquete sigue".
+// El primer paquete identifica el códec; el segundo lleva los comentarios Vorbis. La
+// posición (granule) de la última página es el número de muestras, así que la duración sale
+// de la cola del fichero.
+import meta/binary;
+import meta/flac;
+import meta/vorbis;
+from meta/vorbis import Tags;
+
+/// What an Ogg file tells us.
+pub struct OggInfo {
+    codec: string,
+    duration_ms: int,
+    tags: Tags,
+}
+
+/// Parses `head` (the first octets of the file) and `tail` (the last ones; a page is at most
+/// 65 307 octets, so 64 KB always hold the last page). `None` when it is not an Ogg stream
+/// raystream knows.
+pub fn parse(head: bytes, tail: bytes) -> Option<OggInfo> {
+    if (!head.starts_with(b"OggS")) {
+        return Option.None;
+    }
+    let serial: int = binary.le_u32(head, 14);
+    let ps: [bytes] = packets(head, 2);
+    if (ps.len() == 0) {
+        return Option.None;
+    }
+    let id: bytes = ps[0];
+    let tags_packet: bytes = if (ps.len() > 1) { ps[1] } else { b"" };
+    // Frecuencia de la posición, muestras a descontar al principio, y dónde empiezan los
+    // comentarios dentro del segundo paquete.
+    var codec: string = "";
+    var rate: int = 0;
+    var skip: int = 0;
+    var comments_at: int = 0;
+    if (id.len() >= 16 && id[0] == 1 && id.sub_bytes(1, 7) == b"vorbis") {
+        codec = "vorbis";
+        rate = binary.le_u32(id, 12);
+        comments_at = 7;
+    } else if (id.len() >= 12 && id.starts_with(b"OpusHead")) {
+        // Opus cuenta siempre a 48 kHz, sea cual sea la frecuencia de la entrada.
+        codec = "opus";
+        rate = 48000;
+        skip = binary.le_u16(id, 10);
+        comments_at = 8;
+    } else if (id.len() >= 51 && id[0] == 0x7F && id.sub_bytes(1, 5) == b"FLAC") {
+        // 0x7F "FLAC" · versión (2) · cabeceras (2) · "fLaC" · bloque STREAMINFO.
+        codec = "flac";
+        rate = flac.sample_rate(id.sub_bytes(17, 51));
+        comments_at = 4;
+    } else {
+        return Option.None;
+    }
+    let tags: Tags = if (tags_packet.len() > comments_at) {
+        vorbis.comments(tags_packet, comments_at)
+    } else {
+        Tags { title: "", artist: "", album: "" }
+    };
+    let granule: int = last_granule(tail, serial);
+    let duration: int = if (rate > 0 && granule > skip) {
+        (granule - skip) * 1000 / rate
+    } else {
+        0
+    };
+    Option.Some(OggInfo { codec: codec, duration_ms: duration, tags: tags })
+}
+
+/// The first `want` packets of the first logical stream in `b`. A packet cut by the end of
+/// `b` is returned as far as it goes.
+pub fn packets(b: bytes, want: int) -> [bytes] {
+    var out: [bytes] = [];
+    var current: bytes = b"";
+    let serial: int = binary.le_u32(b, 14);
+    var pos: int = 0;
+    while (pos + 27 <= b.len() && out.len() < want && binary.tag4(b, pos) == "OggS") {
+        let nsegs: int = b[pos + 26];
+        let table: int = pos + 27;
+        var off: int = table + nsegs;
+        let mine: bool = binary.le_u32(b, pos + 14) == serial;
+        // Los segmentos de una página son contiguos: se copia el tramo entero de cada paquete
+        // de una vez, no segmento a segmento.
+        var run: int = off;
+        var k: int = 0;
+        while (k < nsegs && table + k < b.len()) {
+            let lace: int = b[table + k];
+            off = off + lace;
+            if (lace < 255 && mine && out.len() < want) {
+                out.push(current + b.sub_bytes(min_int(run, b.len()), min_int(off, b.len())));
+                current = b"";
+                run = off;
+            }
+            k = k + 1;
+        }
+        if (mine && run < off) {
+            current = current + b.sub_bytes(min_int(run, b.len()), min_int(off, b.len()));
+        }
+        pos = off;
+    }
+    if (current.len() > 0 && out.len() < want) {
+        out.push(current);
+    }
+    out
+}
+
+/// The granule position of the last page of stream `serial` found in `tail`, or -1.
+pub fn last_granule(tail: bytes, serial: int) -> int {
+    var i: int = tail.len() - 27;
+    while (i >= 0) {
+        if (tail[i] == 0x4F
+            && tail[i + 1] == 0x67
+            && tail[i + 2] == 0x67
+            && tail[i + 3] == 0x53
+            && tail[i + 4] == 0
+            && binary.le_u32(tail, i + 14) == serial) {
+            let high: int = binary.le_u32(tail, i + 10);
+            // -1 (todo unos) es "ningún paquete termina en esta página"; y un int de raylang
+            // es de 64 bits con signo: nada real llega al bit alto.
+            if (high < 2147483648) {
+                return high * 4294967296 + binary.le_u32(tail, i + 6);
+            }
+        }
+        i = i - 1;
+    }
+    0 - 1
+}
+
+fn min_int(a: int, b: int) -> int {
+    if (a < b) { a } else { b }
+}
+
+// --- Tests -----------------------------------------------------------------------------------
+
+/// One page carrying `packets` entirely, at granule `granule` of stream `serial`.
+pub fn page(serial: int, seq: int, granule: int, packets_in: [bytes]) -> bytes {
+    var lacing: [int] = [];
+    var data: bytes = b"";
+    var i: int = 0;
+    while (i < packets_in.len()) {
+        var left: int = packets_in[i].len();
+        while (left >= 255) {
+            lacing.push(255);
+            left = left - 255;
+        }
+        lacing.push(left);
+        data = data + packets_in[i];
+        i = i + 1;
+    }
+    b"OggS"
+        + bytes_of([0, 0])
+        + le32(granule % 4294967296)
+        + le32(granule / 4294967296)
+        + le32(serial)
+        + le32(seq)
+        + le32(0)
+        + bytes_of([lacing.len()])
+        + bytes_of(lacing)
+        + data
+}
+
+fn le32(n: int) -> bytes {
+    bytes_of([n % 256, (n / 256) % 256, (n / 65536) % 256, (n / 16777216) % 256])
+}
+
+/// An OpusHead packet with `pre_skip`.
+pub fn opus_head(pre_skip: int) -> bytes {
+    b"OpusHead"
+        + bytes_of([1, 2, pre_skip % 256, pre_skip / 256])
+        + le32(48000)
+        + bytes_of([0, 0, 0])
+}
+
+@test
+fn an_opus_stream() {
+    // 3 s a 48 kHz más 312 muestras de pre-skip, y las etiquetas en su propia página.
+    let tags: bytes = b"OpusTags" + vorbis.encode("enc", ["TITLE=Tres segundos", "ARTIST=Opus"]);
+    let file: bytes = page(7, 0, 0, [opus_head(312)])
+        + page(7, 1, 0, [tags])
+        + page(7, 2, 96000, [b"audio"])
+        + page(7, 3, 144312, [b"audio"]);
+    match (parse(file, file)) {
+        Option.Some(info) => {
+            assert_eq(info.codec, "opus");
+            assert_eq(info.duration_ms, 3000);
+            assert_eq(info.tags.title, "Tres segundos");
+            assert_eq(info.tags.artist, "Opus");
+        },
+        Option.None => panic("an Opus stream should parse"),
+    }
+}
+
+@test
+fn a_vorbis_stream_whose_tags_span_pages() {
+    // Identificación Vorbis: 44,1 kHz. Los comentarios pasan de 255 octetos: varios segmentos.
+    let ident: bytes = bytes_of([1])
+        + b"vorbis"
+        + le32(0)
+        + bytes_of([2])
+        + le32(44100)
+        + le32(0)
+        + le32(0)
+        + le32(0)
+        + bytes_of([0xB8, 1]);
+    let long_album: string = "x".repeat(600);
+    let comment: bytes = bytes_of(
+        [3]
+    ) + b"vorbis" + vorbis.encode("Xiph", ["TITLE=Vorbis", "ALBUM=${long_album}"]);
+    // El paquete de comentarios, partido a mano entre dos páginas.
+    let first_half: bytes = comment.sub_bytes(0, 510);
+    let second_half: bytes = comment.sub_bytes(510, comment.len());
+    let p1: bytes = b"OggS"
+        + bytes_of([0, 0])
+        + le32(0)
+        + le32(0)
+        + le32(9)
+        + le32(1)
+        + le32(0)
+        + bytes_of([2, 255, 255])
+        + first_half;
+    let rest: int = second_half.len();
+    var lacing: [int] = [];
+    var left: int = rest;
+    while (left >= 255) {
+        lacing.push(255);
+        left = left - 255;
+    }
+    lacing.push(left);
+    let p2: bytes = b"OggS"
+        + bytes_of([1, 0])
+        + le32(0)
+        + le32(0)
+        + le32(9)
+        + le32(2)
+        + le32(0)
+        + bytes_of([lacing.len()])
+        + bytes_of(lacing)
+        + second_half;
+    let file: bytes = page(9, 0, 0, [ident]) + p1 + p2 + page(9, 3, 88200, [b"a"]);
+    match (parse(file, file)) {
+        Option.Some(info) => {
+            assert_eq(info.codec, "vorbis");
+            assert_eq(info.duration_ms, 2000);
+            assert_eq(info.tags.title, "Vorbis");
+            assert_eq(info.tags.album, long_album);
+        },
+        Option.None => panic("a Vorbis stream should parse"),
+    }
+}
+
+@test
+fn flac_in_ogg_and_other_streams() {
+    let ident: bytes = bytes_of([0x7F])
+        + b"FLAC"
+        + bytes_of([1, 0, 0, 1])
+        + b"fLaC"
+        + flac.block(flac.STREAMINFO, false, flac.streaminfo_for(48000, 240000));
+    let tags: bytes = flac.block(flac.VORBIS_COMMENT, true, vorbis.encode("v", ["TITLE=Ogg FLAC"]));
+    let file: bytes = page(3, 0, 0, [ident]) + page(3, 1, 0, [tags]) + page(3, 2, 240000, [b"a"]);
+    match (parse(file, file)) {
+        Option.Some(info) => {
+            assert_eq(info.codec, "flac");
+            assert_eq(info.duration_ms, 5000);
+            assert_eq(info.tags.title, "Ogg FLAC");
+        },
+        Option.None => panic("FLAC in Ogg should parse"),
+    }
+    // Un códec desconocido (Theora) y algo que no es Ogg.
+    assert(parse(page(1, 0, 0, [bytes_of([0x80]) + b"theora"]), b"").is_none());
+    assert(parse(b"RIFF....", b"").is_none());
+}
+
+@test
+fn the_last_page_of_the_stream_gives_the_length() {
+    // Una página final de otra serie (un Ogg multiplexado) no cuenta, ni un granule -1.
+    let tail: bytes = page(5, 9, 1000, [b"a"])
+        + page(6, 9, 99999, [b"b"])
+        + b"OggS"
+        + bytes_of([0, 0, 255, 255, 255, 255, 255, 255, 255, 255])
+        + le32(5)
+        + le32(10)
+        + le32(0)
+        + bytes_of([0]);
+    assert_eq(last_granule(tail, 5), 1000);
+    assert_eq(last_granule(tail, 6), 99999);
+    assert_eq(last_granule(tail, 4), 0 - 1);
+    assert_eq(last_granule(b"", 5), 0 - 1);
+}

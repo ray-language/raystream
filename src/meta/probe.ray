@@ -2,9 +2,12 @@
 // Nunca se lee un fichero entero — como mucho, una ventana de cabecera y otra de cola.
 import std/fs;
 import catalog/library;
+import meta/flac;
 import meta/id3;
 import meta/imagemeta;
 import meta/mp4;
+import meta/ogg;
+import meta/vorbis;
 import meta/wav;
 from catalog/library import Item, Kind;
 
@@ -61,6 +64,14 @@ fn probe_audio(path: string, it: Item) {
     }
     if (ext == "m4a" || ext == "aac") {
         probe_video(path, it);
+        return;
+    }
+    if (ext == "flac") {
+        probe_flac(path, it);
+        return;
+    }
+    if (ext == "ogg" || ext == "oga" || ext == "opus") {
+        probe_ogg(path, it);
         return;
     }
     // MP3 y demás: etiquetas ID3 y duración estimada, leyendo sólo cabeceras.
@@ -130,6 +141,117 @@ fn walk_frames(h: int, hd: id3.Header, it: Item) {
         pos = body + fh.size;
     }
 }
+
+// FLAC: recorre las cabeceras de bloque de metadatos. Lee STREAMINFO (34 octetos) y los
+// comentarios; de la carátula (PICTURE) basta un prefijo para saber que existe.
+fn probe_flac(path: string, it: Item) {
+    match (fs.open(path, "r")) {
+        Result.Err(_) => { },
+        Result.Ok(h) => {
+            let blocks: [FlacBlock] = flac_blocks(h, it.size);
+            var i: int = 0;
+            while (i < blocks.len()) {
+                let b: flac.Block = blocks[i].header;
+                let body: int = blocks[i].body;
+                if (b.kind == flac.STREAMINFO) {
+                    it.duration_ms = flac.duration_ms(read_at(h, body, min_int(b.len, 34)));
+                } else if (b.kind == flac.VORBIS_COMMENT) {
+                    let t: vorbis.Tags = vorbis.comments(
+                        read_at(h, body, min_int(b.len, COMMENT_MAX)),
+                        0
+                    );
+                    it.title = t.title;
+                    it.artist = t.artist;
+                    it.album = t.album;
+                } else if (b.kind == flac.PICTURE && !it.has_cover) {
+                    it.has_cover = flac_picture(h, blocks[i]).is_some();
+                }
+                i = i + 1;
+            }
+            close(h);
+        },
+    }
+}
+
+// Un bloque de metadatos de FLAC y dónde empieza su cuerpo en el fichero.
+struct FlacBlock {
+    header: flac.Block,
+    body: int,
+}
+
+// Las cabeceras de los bloques de metadatos de un FLAC abierto, sin leer ningún cuerpo.
+// Admite una etiqueta ID3 delante del "fLaC", que algunos programas añaden.
+fn flac_blocks(h: int, size: int) -> [FlacBlock] {
+    var out: [FlacBlock] = [];
+    var pos: int = 0;
+    match (id3.header_of(read_at(h, 0, 14))) {
+        Option.Some(hd) => {
+            pos = hd.total;
+        },
+        Option.None => { },
+    }
+    if (read_at(h, pos, 4) != b"fLaC") {
+        return out;
+    }
+    pos = pos + 4;
+    // Un FLAC real tiene un puñado de bloques; el tope evita recorrer basura.
+    while (pos + 4 <= size && out.len() < 64) {
+        let b: flac.Block = flac.block_at(read_at(h, pos, 4), 0);
+        let body: int = pos + 4;
+        if (b.kind == 127 || body + b.len > size) {
+            return out;
+        }
+        out.push(FlacBlock { header: b, body: body });
+        if (b.last) {
+            return out;
+        }
+        pos = body + b.len;
+    }
+    out
+}
+
+// La imagen de un bloque PICTURE como tramo del fichero, si trae octetos de imagen.
+fn flac_picture(h: int, fb: FlacBlock) -> Option<Cover> {
+    let prefix: bytes = read_at(h, fb.body, min_int(fb.header.len, PICTURE_PREFIX));
+    let start: int = flac.picture_data_offset(prefix);
+    let len: int = flac.picture_data_len(prefix);
+    if (start < 0 || start + len > fb.header.len) {
+        return Option.None;
+    }
+    Option.Some(
+        Cover {
+            from_byte: fb.body + start,
+            to_byte: fb.body + start + len - 1,
+            mime: safe_image_mime(flac.picture_mime(prefix))
+        }
+    )
+}
+
+// Ogg (Vorbis, Opus o FLAC dentro de Ogg): una ventana de cabeza para el códec y las
+// etiquetas, y otra de cola para la posición de la última página, que da la duración.
+fn probe_ogg(path: string, it: Item) {
+    let head: bytes = read_window(path, 0, OGG_WINDOW);
+    let tail: bytes = if (it.size > OGG_WINDOW) {
+        read_window(path, it.size - OGG_WINDOW, OGG_WINDOW)
+    } else {
+        head
+    };
+    match (ogg.parse(head, tail)) {
+        Option.None => { },
+        Option.Some(info) => {
+            it.duration_ms = info.duration_ms;
+            it.title = info.tags.title;
+            it.artist = info.tags.artist;
+            it.album = info.tags.album;
+        },
+    }
+}
+
+/// Longest Vorbis comment block read from a FLAC (tags, not embedded art).
+const COMMENT_MAX: int = 65536;
+
+/// Head and tail windows of an Ogg file: a page is at most 65 307 octets.
+const OGG_WINDOW: int = 65536;
 
 /// Octets read from an APIC body to find where its image data starts.
 const PICTURE_PREFIX: int = 512;
@@ -222,9 +344,17 @@ pub fn cover_range(path: string) -> Option<Cover> {
     match (fs.open(path, "r")) {
         Result.Err(_) => Option.None,
         Result.Ok(h) => {
-            let found: Option<Cover> = match (id3.header_of(read_at(h, 0, 14))) {
-                Option.None => Option.None,
-                Option.Some(hd) => find_cover(h, hd),
+            let found: Option<Cover> = if (library.extension_of(path) == "flac") {
+                let size: int = match (fs.stat(path)) {
+                    Result.Ok(st) => st.size,
+                    Result.Err(_) => 0,
+                };
+                find_flac_cover(h, size)
+            } else {
+                match (id3.header_of(read_at(h, 0, 14))) {
+                    Option.None => Option.None,
+                    Option.Some(hd) => find_cover(h, hd),
+                }
             };
             close(h);
             found
@@ -262,6 +392,22 @@ fn find_cover(h: int, hd: id3.Header) -> Option<Cover> {
             }
         }
         pos = body + fh.size;
+    }
+    Option.None
+}
+
+// La primera carátula (bloque PICTURE) de un FLAC, como tramo del fichero.
+fn find_flac_cover(h: int, size: int) -> Option<Cover> {
+    let blocks: [FlacBlock] = flac_blocks(h, size);
+    var i: int = 0;
+    while (i < blocks.len()) {
+        if (blocks[i].header.kind == flac.PICTURE) {
+            let c: Option<Cover> = flac_picture(h, blocks[i]);
+            if (c.is_some()) {
+                return c;
+            }
+        }
+        i = i + 1;
     }
     Option.None
 }
@@ -473,4 +619,58 @@ fn a_hostile_cover_mime_cannot_reach_a_header() {
     assert_eq(safe_image_mime("image/jpeg\r\nSet-Cookie: x=1"), "image/jpeg");
     assert_eq(safe_image_mime("text/html"), "image/jpeg");
     assert_eq(safe_image_mime(""), "image/jpeg");
+}
+
+@test
+fn flac_and_ogg_files_are_probed_from_disk() {
+    let root: string = fs.make_temp_dir("raystream_lossless").unwrap_or("");
+    // FLAC: STREAMINFO de 2 s, una carátula de 100 KB DELANTE de los comentarios (hay que
+    // saltarla) y el audio detrás.
+    var picture: [int] = [];
+    var p: int = 0;
+    while (p < 102400) {
+        picture.push(p % 251);
+        p = p + 1;
+    }
+    let image_bytes: bytes = bytes_of([0x89, 0x50, 0x4E, 0x47]) + bytes_of(picture);
+    let file: bytes = b"fLaC"
+        + flac.block(flac.STREAMINFO, false, flac.streaminfo_for(44100, 88200))
+        + flac.block(flac.PICTURE, false, flac.picture_for("image/png", image_bytes))
+        + flac.block(
+            flac.VORBIS_COMMENT,
+            true,
+            vorbis.encode("ref", ["TITLE=Sin pérdida", "ARTIST=FLAC", "ALBUM=Disco"])
+        )
+        + b"audio frames";
+    fs.write_file_bytes(root + "/a.flac", file).unwrap_or(0);
+    var it: Item = library.new_item("a.flac", Kind.Audio, file.len(), 0);
+    probe(root + "/a.flac", it);
+    assert_eq(it.duration_ms, 2000);
+    assert_eq(it.title, "Sin pérdida");
+    assert_eq(it.artist, "FLAC");
+    assert_eq(it.album, "Disco");
+    assert(it.has_cover);
+    match (cover_range(root + "/a.flac")) {
+        Option.Some(c) => {
+            assert_eq(c.mime, "image/png");
+            assert_eq(file.sub_bytes(c.from_byte, c.to_byte + 1), image_bytes);
+        },
+        Option.None => panic("the FLAC cover should be found"),
+    }
+
+    // Opus en Ogg: 1,5 s a 48 kHz tras 312 muestras de pre-skip.
+    let tags: bytes = b"OpusTags" + vorbis.encode("enc", ["title=Opus en disco"]);
+    let opus: bytes = ogg.page(
+        1,
+        0,
+        0,
+        [ogg.opus_head(312)]
+    ) + ogg.page(1, 1, 0, [tags]) + ogg.page(1, 2, 72312, [b"audio"]);
+    fs.write_file_bytes(root + "/b.opus", opus).unwrap_or(0);
+    var ot: Item = library.new_item("b.opus", Kind.Audio, opus.len(), 0);
+    probe(root + "/b.opus", ot);
+    assert_eq(ot.duration_ms, 1500);
+    assert_eq(ot.title, "Opus en disco");
+    assert(!ot.has_cover);
+    fs.remove_all(root).unwrap_or(0);
 }

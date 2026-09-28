@@ -42,9 +42,11 @@ reiniciar.
   `mime_of` del paquete no conoce `.mov`, `.mkv`, `.m4a`, `.flac` ni `.ogg`.
 - **Catálogo con metadatos**, todos parseados en raylang: duración y dimensiones de MP4
   (`moov`/`mvhd`/`tkhd`), duración exacta de WAV (RIFF), etiquetas y carátula de MP3 (ID3v2.2/2.3/2.4)
-  con estimación de duración, y dimensiones de PNG, JPEG, GIF y WebP sin decodificar la imagen.
+  con estimación de duración, duración exacta, etiquetas y carátula de FLAC, duración y etiquetas
+  de Ogg (Vorbis, Opus y FLAC en Ogg), y dimensiones de PNG, JPEG, GIF y WebP sin decodificar la
+  imagen. Ninguno lee el fichero entero: cabeceras, y en Ogg una ventana de cola para la duración.
 - **Miniaturas**: los PNG se reescalan con un filtro de caja y se cachean en `.raystream/thumbs`;
-  los audios con carátula embebida la sirven como miniatura.
+  los MP3 y FLAC con carátula embebida la sirven como miniatura.
 - **Biblioteca viva**: un vigilante sobre eventos del kernel (`fs.watch`) reindexa al vuelo y empuja
   el cambio a los navegadores por Server-Sent Events. Copias un fichero en la biblioteca y aparece.
   El reindexado es incremental: sólo se abren los ficheros nuevos o modificados.
@@ -103,7 +105,7 @@ actores y se habla con ellos por canales:
 | `src/config.ray` | argumentos y valores por defecto |
 | `src/router.ray` | ruta → `Route` tipada, query string |
 | `src/catalog/` | `scan` (árbol y rutas seguras), `library` (modelo y JSON), `indexer` (escaneo + metadatos, incremental), `store` (el actor, con índice por id y JSON prerenderizado) |
-| `src/meta/` | `binary`, `id3`, `mp4`, `wav`, `imagemeta`, `probe` |
+| `src/meta/` | `binary`, `id3`, `mp4`, `wav`, `flac`, `ogg`, `vorbis` (comentarios), `imagemeta`, `probe` |
 | `src/http/` | `serve_media` (MIME del índice y log sobre `webserver.serve_file`), `api` (JSON) |
 | `src/live/` | `events` (SSE + vigilante), `room` (salas WebSocket) |
 | `src/subtitles.ray` | descubrimiento de pistas y conversión SRT → WebVTT |
@@ -127,7 +129,7 @@ VM y **32 ms** en el binario nativo, y 0,4 ms si ya está cacheada.
 ## Tests
 
 ```sh
-ray test                        # la suite completa (68)
+ray test                        # la suite completa (77)
 ray run findings/check.ray      # los 23 hallazgos contra el raylang instalado
 ray test src/meta/id3.ray       # un módulo
 ```
@@ -164,7 +166,10 @@ curl -s "localhost:8080/subs/<id>/0" | head -4
 - Una petición por conexión: el camino crudo de `net` cierra al responder (comprobado: la segunda
   petición sobre el mismo socket no llega), así que cada salto en la barra abre una conexión nueva.
   El límite es de 128 simultáneas, y cada conexión larga (SSE, sala) ocupa una de ellas.
-- La duración de un MP3 VBR es una estimación; la de MP4 y WAV es exacta.
+- La duración de un MP3 VBR es una estimación; la de MP4, WAV, FLAC y Ogg es exacta.
+- WebM y MKV se sirven sin metadatos (no hay lector de Matroska), y las carátulas de M4A y Ogg no
+  se extraen: en Ogg van en base64 dentro de los comentarios, y no se pueden servir como un tramo
+  del fichero.
 - Los subtítulos son ficheros hermanos: no se extraen las pistas incrustadas en el contenedor
   (haría falta demuxar MP4/Matroska).
 

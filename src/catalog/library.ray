@@ -97,6 +97,7 @@ pub fn kind_of_extension(ext: string) -> Option<Kind> {
         || ext == "wav"
         || ext == "flac"
         || ext == "ogg"
+        || ext == "oga"
         || ext == "opus") {
         Option.Some(Kind.Audio)
     } else if (ext == "png"
@@ -130,10 +131,10 @@ pub fn mime_of_extension(ext: string) -> string {
         "audio/wav"
     } else if (ext == "flac") {
         "audio/flac"
-    } else if (ext == "ogg") {
+    } else if (ext == "ogg" || ext == "oga" || ext == "opus") {
+        // Un .opus es Opus dentro de Ogg (RFC 7845): `audio/opus` es el tipo de RTP, y no
+        // todos los navegadores lo aceptan en un <audio>.
         "audio/ogg"
-    } else if (ext == "opus") {
-        "audio/opus"
     } else if (ext == "png") {
         "image/png"
     } else if (ext == "jpg" || ext == "jpeg") {

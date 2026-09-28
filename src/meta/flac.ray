@@ -1,0 +1,165 @@
+// FLAC: duración exacta, etiquetas y carátula, leyendo sólo la cabecera de metadatos.
+//
+//   "fLaC" · { cabecera de bloque (4) · cuerpo } …
+//   cabecera: 1 bit "último" · 7 bits tipo · 24 bits longitud (big-endian)
+//   tipos: 0 STREAMINFO (34 octetos) · 4 VORBIS_COMMENT · 6 PICTURE
+//
+// Las funciones son puras sobre `bytes`: el recorrido del fichero (que salta los bloques sin
+// leerlos, como la carátula) lo hace `meta/probe`.
+import meta/binary;
+
+pub const STREAMINFO: int = 0;
+
+pub const VORBIS_COMMENT: int = 4;
+
+pub const PICTURE: int = 6;
+
+/// A metadata block header.
+pub struct Block {
+    kind: int,
+    len: int,
+    last: bool,
+}
+
+/// The header of the block whose four header octets start at `at`.
+pub fn block_at(b: bytes, at: int) -> Block {
+    if (at + 4 > b.len()) {
+        return Block { kind: 127, len: 0, last: true };
+    }
+    let first: int = b[at];
+    Block {
+        kind: first % 128,
+        len: (b[at + 1] * 256 + b[at + 2]) * 256 + b[at + 3],
+        last: first >= 128
+    }
+}
+
+/// The duration in milliseconds from a STREAMINFO body (0 when the stream does not say how
+/// many samples it has).
+pub fn duration_ms(streaminfo: bytes) -> int {
+    if (streaminfo.len() < 18) {
+        return 0;
+    }
+    // Octetos 10..17: frecuencia (20 bits) · canales (3) · bits (5) · muestras totales (36).
+    let rate: int = sample_rate(streaminfo);
+    let samples: int = (streaminfo[13] % 16) * 4294967296 + binary.be_u32(streaminfo, 14);
+    if (rate <= 0) { 0 } else { samples * 1000 / rate }
+}
+
+/// The sample rate a STREAMINFO body declares (0 when it is too short).
+pub fn sample_rate(streaminfo: bytes) -> int {
+    if (streaminfo.len() < 13) {
+        return 0;
+    }
+    (streaminfo[10] * 256 + streaminfo[11]) * 16 + streaminfo[12] / 16
+}
+
+/// Where the image data starts inside a PICTURE body, from a prefix of it; -1 when the
+/// prefix is too short to tell or the block is malformed.
+///
+///   tipo (4) · mime_len (4) · mime · desc_len (4) · desc · ancho, alto, bits, colores (16)
+///   · data_len (4) · datos
+pub fn picture_data_offset(prefix: bytes) -> int {
+    let mime_len: int = binary.be_u32(prefix, 4);
+    let desc_at: int = 8 + mime_len;
+    if (desc_at + 4 > prefix.len()) {
+        return 0 - 1;
+    }
+    let data_len_at: int = desc_at + 4 + binary.be_u32(prefix, desc_at) + 16;
+    if (data_len_at + 4 > prefix.len() || binary.be_u32(prefix, data_len_at) <= 0) {
+        return 0 - 1;
+    }
+    data_len_at + 4
+}
+
+/// The image data length declared by a PICTURE body (see `picture_data_offset`).
+pub fn picture_data_len(prefix: bytes) -> int {
+    let start: int = picture_data_offset(prefix);
+    if (start < 0) { 0 } else { binary.be_u32(prefix, start - 4) }
+}
+
+/// The MIME type declared by a PICTURE body ("" when it does not fit the prefix).
+pub fn picture_mime(prefix: bytes) -> string {
+    let mime_len: int = binary.be_u32(prefix, 4);
+    if (8 + mime_len > prefix.len()) {
+        return "";
+    }
+    from_utf8(prefix.sub_bytes(8, 8 + mime_len)).unwrap_or("")
+}
+
+// --- Tests -----------------------------------------------------------------------------------
+
+/// A STREAMINFO body with `rate` Hz and `samples` samples (stereo, 16 bits).
+pub fn streaminfo_for(rate: int, samples: int) -> bytes {
+    var b: [int] = [0, 16, 16, 0, 0, 0, 0, 0, 0, 0];
+    b.push(rate / 4096);
+    b.push((rate / 16) % 256);
+    // Frecuencia (4 bits bajos) · canales-1 = 1 (3 bits) · bits-1 = 15 (bit alto de 5).
+    b.push((rate % 16) * 16 + 1 * 2 + 0);
+    // Bits-1 = 15 (4 bits bajos) · 4 bits altos de las muestras.
+    b.push(15 * 16 + (samples / 4294967296) % 16);
+    b.push((samples / 16777216) % 256);
+    b.push((samples / 65536) % 256);
+    b.push((samples / 256) % 256);
+    b.push(samples % 256);
+    var i: int = 0;
+    while (i < 16) {
+        b.push(0);
+        i = i + 1;
+    }
+    bytes_of(b)
+}
+
+/// A block header with its body.
+pub fn block(kind: int, last: bool, body: bytes) -> bytes {
+    let n: int = body.len();
+    let first: int = if (last) { kind + 128 } else { kind };
+    bytes_of([first, (n / 65536) % 256, (n / 256) % 256, n % 256]) + body
+}
+
+/// A PICTURE body carrying `data` as `mime`.
+pub fn picture_for(mime: string, data: bytes) -> bytes {
+    be32(3)
+        + be32(mime.len())
+        + mime.to_bytes()
+        + be32(5)
+        + b"front"
+        + be32(1)
+        + be32(1)
+        + be32(24)
+        + be32(0)
+        + be32(data.len())
+        + data
+}
+
+fn be32(n: int) -> bytes {
+    bytes_of([(n / 16777216) % 256, (n / 65536) % 256, (n / 256) % 256, n % 256])
+}
+
+@test
+fn the_duration_comes_from_streaminfo() {
+    // 44 100 Hz y 132 300 muestras: 3 s exactos.
+    assert_eq(duration_ms(streaminfo_for(44100, 132300)), 3000);
+    // 96 kHz, una hora: el total de muestras pasa de 2^32 cuando son muchas horas.
+    assert_eq(duration_ms(streaminfo_for(96000, 96000 * 3600)), 3600000);
+    assert_eq(duration_ms(streaminfo_for(48000, 0)), 0);
+    assert_eq(duration_ms(b"short"), 0);
+}
+
+@test
+fn block_headers_and_pictures() {
+    let b: bytes = block(VORBIS_COMMENT, true, b"abc");
+    let h: Block = block_at(b, 0);
+    assert_eq(h.kind, VORBIS_COMMENT);
+    assert_eq(h.len, 3);
+    assert(h.last);
+
+    let pic: bytes = picture_for("image/png", b"PNGDATA");
+    let start: int = picture_data_offset(pic);
+    assert_eq(pic.sub_bytes(start, pic.len()), b"PNGDATA");
+    assert_eq(picture_data_len(pic), 7);
+    assert_eq(picture_mime(pic), "image/png");
+    // Sin datos de imagen, o con el prefijo cortado: no hay carátula.
+    assert_eq(picture_data_offset(picture_for("image/png", b"")), 0 - 1);
+    assert_eq(picture_data_offset(pic.sub_bytes(0, 12)), 0 - 1);
+}
